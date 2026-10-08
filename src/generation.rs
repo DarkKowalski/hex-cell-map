@@ -1,0 +1,347 @@
+use crate::{
+    gis::{
+        cache::Cache,
+        raster::{self, RasterKind, RasterLayer},
+        vectors::{self, RiverReach},
+    },
+    jobs::JobContext,
+    map_core::*,
+};
+use anyhow::{Context, Result, ensure};
+use geo::Intersects;
+use hexx::Hex;
+use std::collections::{BTreeMap, HashMap};
+
+/// Acquires all required GIS layers and returns a complete map atomically.
+pub fn generate(
+    settings: &GenerationSettings,
+    cache: &Cache,
+    context: &JobContext,
+) -> Result<MapDocument> {
+    settings.validate()?;
+    context.report(0.02, "Validating region and building hex grid")?;
+    let projection = Projection::new(settings.region)?;
+    let (mut cells, bounds_m) = build_grid(settings, &projection)?;
+    let spacing = settings.spacing_km * 1000.;
+    let padding_degrees = spacing
+        / 100_000.
+        / settings
+            .region
+            .north
+            .abs()
+            .max(settings.region.south.abs())
+            .to_radians()
+            .cos();
+    let input_region = settings.region.expanded(padding_degrees);
+    let elevation = raster::acquire(
+        cache,
+        input_region,
+        spacing / 8.,
+        RasterKind::Elevation,
+        context,
+    )?;
+    let cover = raster::acquire(
+        cache,
+        input_region,
+        spacing / 8.,
+        RasterKind::LandCover,
+        context,
+    )?;
+    let (rivers, river_sources) = vectors::rivers(
+        cache,
+        input_region,
+        &projection,
+        settings.min_river_discharge,
+        context,
+    )?;
+    let (cities, city_source) = vectors::cities(
+        cache,
+        settings.region,
+        settings.min_city_population,
+        context,
+    )?;
+    context.report(0.7, "Aggregating elevation and land cover")?;
+    aggregate_cells(
+        &mut cells,
+        settings,
+        &projection,
+        &elevation,
+        &cover,
+        context,
+    )?;
+    let index: HashMap<_, _> = cells.iter().enumerate().map(|(i, c)| (c.hex, i)).collect();
+    context.report(0.85, "Rasterizing rivers into hex cells")?;
+    rasterize_rivers(&mut cells, &index, &rivers, spacing, bounds_m, context)?;
+    context.report(0.92, "Assigning cities")?;
+    assign_cities(&mut cells, &index, cities, &projection, spacing)?;
+    let mut sources = elevation.sources();
+    sources.extend(cover.sources());
+    sources.extend(river_sources);
+    sources.push(city_source);
+    let river_network: BTreeMap<_, _> = rivers
+        .iter()
+        .map(|r| {
+            (
+                r.id,
+                RiverRecord {
+                    id: r.id,
+                    next_down: r.next_down,
+                    discharge: r.discharge,
+                    stream_order: r.stream_order,
+                },
+            )
+        })
+        .collect();
+    let mut document = MapDocument {
+        schema_version: 1,
+        generator_version: "gis-hex-v1".into(),
+        settings: settings.clone(),
+        projection_wkt: projection.wkt,
+        bounds_m,
+        cells,
+        sources,
+        river_network: river_network.into_values().collect(),
+        index,
+    };
+    document.rebuild_index()?;
+    context.report(
+        1.,
+        format!(
+            "Generated {} hexes from real GIS data",
+            document.cells.len()
+        ),
+    )?;
+    Ok(document)
+}
+
+fn aggregate_cells(
+    cells: &mut [Cell],
+    settings: &GenerationSettings,
+    projection: &Projection,
+    elevation: &RasterLayer,
+    cover: &RasterLayer,
+    context: &JobContext,
+) -> Result<()> {
+    let spacing = settings.spacing_km * 1000.;
+    let radius = spacing / 3_f64.sqrt();
+    // A deterministic center and two six-point rings sample each hex's interior.
+    let mut offsets = vec![[0., 0.]];
+    for scale in [0.4, 0.82] {
+        for corner in 0..6 {
+            let angle = (30. + f64::from(corner) * 60.).to_radians();
+            offsets.push([radius * scale * angle.cos(), radius * scale * angle.sin()]);
+        }
+    }
+    for batch in cells.chunks_mut(512) {
+        context.check()?;
+        let mut positions: Vec<_> = batch
+            .iter()
+            .flat_map(|c| {
+                offsets
+                    .iter()
+                    .map(move |o| [c.center_m[0] + o[0], c.center_m[1] + o[1]])
+            })
+            .collect();
+        projection.unproject(&mut positions)?;
+        for (cell, samples) in batch.iter_mut().zip(positions.chunks(offsets.len())) {
+            let mut heights = Vec::new();
+            let mut trees = 0_u32;
+            let mut water = 0_u32;
+            for [lon, lat] in samples {
+                let class = cover.sample(*lon, *lat).with_context(|| {
+                    format!("Missing required land cover at {lat:.5}°, {lon:.5}°")
+                })? as u8;
+                ensure!(
+                    [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100].contains(&class),
+                    "Unknown WorldCover class {class} at {lat}, {lon}"
+                );
+                if class == 10 || class == 95 {
+                    trees += 1;
+                }
+                if class == 80 {
+                    water += 1;
+                }
+                let height = match elevation.sample(*lon, *lat) {
+                    Some(h) => h,
+                    None if class == 80 => 0.,
+                    None => {
+                        anyhow::bail!("Missing required land elevation at {lat:.5}°, {lon:.5}°")
+                    }
+                };
+                heights.push(height);
+            }
+            let mean = heights.iter().sum::<f64>() / heights.len() as f64;
+            let min = heights.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = heights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let relief = max - min;
+            let slope = (relief / (radius * 1.64)).atan().to_degrees();
+            cell.generated_elevation_m = mean;
+            cell.elevation_m = mean;
+            cell.relief_m = relief;
+            cell.slope_degrees = slope;
+            cell.forest_fraction = f64::from(trees) / samples.len() as f64;
+            cell.water_fraction = f64::from(water) / samples.len() as f64;
+            cell.landscape = if relief >= settings.mountain_relief_m
+                || slope >= settings.mountain_slope_degrees
+            {
+                Landscape::Mountain
+            } else if cell.forest_fraction >= settings.forest_fraction {
+                Landscape::Forest
+            } else {
+                Landscape::Plains
+            };
+            if cell.water_fraction >= 0.5 {
+                cell.surface = Surface::Water;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn rasterize_rivers(
+    cells: &mut [Cell],
+    index: &HashMap<Hex, usize>,
+    reaches: &[RiverReach],
+    spacing: f64,
+    bounds: [f64; 4],
+    context: &JobContext,
+) -> Result<()> {
+    for (reach_index, reach) in reaches.iter().enumerate() {
+        if reach_index % 128 == 0 {
+            context.check()?;
+        }
+        for segment in reach.points_m.windows(2) {
+            let [a, b] = [segment[0], segment[1]];
+            let min_x = a[0].min(b[0]).max(bounds[0] - spacing);
+            let max_x = a[0].max(b[0]).min(bounds[2] + spacing);
+            let min_y = a[1].min(b[1]).max(bounds[1] - spacing);
+            let max_y = a[1].max(b[1]).min(bounds[3] + spacing);
+            if min_x > max_x || min_y > max_y {
+                continue;
+            }
+            let r0 = point_hex([min_x, min_y], spacing).y - 2;
+            let r1 = point_hex([max_x, max_y], spacing).y + 2;
+            let line = geo::Line::new(
+                geo::Coord { x: a[0], y: a[1] },
+                geo::Coord { x: b[0], y: b[1] },
+            );
+            for r in r0..=r1 {
+                let q0 = (min_x / spacing - f64::from(r) / 2.).floor() as i32 - 1;
+                let q1 = (max_x / spacing - f64::from(r) / 2.).ceil() as i32 + 1;
+                for q in q0..=q1 {
+                    let hex = Hex::new(q, r);
+                    if let Some(&i) = index.get(&hex) {
+                        if line.intersects(&hex_polygon(hex, spacing)) {
+                            let cell = &mut cells[i];
+                            if !cell.river_ids.contains(&reach.id) {
+                                cell.river_ids.push(reach.id);
+                            }
+                            // Lakes and coastal water remain open water; river identity is retained.
+                            if cell.surface != Surface::Water {
+                                cell.surface = Surface::River;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for cell in cells {
+        cell.river_ids.sort_unstable();
+    }
+    Ok(())
+}
+
+pub fn assign_cities(
+    cells: &mut [Cell],
+    index: &HashMap<Hex, usize>,
+    cities: Vec<City>,
+    projection: &Projection,
+    spacing: f64,
+) -> Result<()> {
+    let mut positions: Vec<_> = cities.iter().map(|c| [c.lon, c.lat]).collect();
+    projection.project(&mut positions)?;
+    for (city, position) in cities.into_iter().zip(positions) {
+        let hex = point_hex(position, spacing);
+        let i = *index
+            .get(&hex)
+            .with_context(|| format!("City {} lies outside generated coverage", city.name))?;
+        cells[i].cities.push(city);
+    }
+    for cell in cells {
+        cell.cities.sort_by_key(|c| c.id);
+    }
+    Ok(())
+}
+
+pub fn summary(document: &MapDocument) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for cell in &document.cells {
+        *counts.entry(format!("{:?}", cell.landscape)).or_insert(0) += 1;
+        if cell.surface != Surface::Land {
+            *counts.entry(format!("{:?}", cell.surface)).or_insert(0) += 1;
+        }
+        *counts.entry("Cities".into()).or_insert(0) += cell.cities.len();
+    }
+    counts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn river_supercover_is_connected_across_boundaries_and_junctions() -> Result<()> {
+        let settings = GenerationSettings::default();
+        let projection = Projection::new(settings.region)?;
+        let (mut cells, bounds) = build_grid(&settings, &projection)?;
+        let index = cells.iter().enumerate().map(|(i, c)| (c.hex, i)).collect();
+        let river = RiverReach {
+            id: 1,
+            next_down: 0,
+            discharge: 100.,
+            stream_order: 5,
+            points_m: vec![[-20_000., -20_000.], [0., 0.], [20_000., 20_000.]],
+        };
+        rasterize_rivers(
+            &mut cells,
+            &index,
+            &[river],
+            2000.,
+            bounds,
+            &JobContext::default(),
+        )?;
+        let water: HashSet<_> = cells
+            .iter()
+            .filter(|c| c.surface == Surface::River)
+            .map(|c| c.hex)
+            .collect();
+        assert!(water.len() > 10);
+        let mut seen = HashSet::new();
+        let mut pending = vec![*water.iter().next().unwrap()];
+        while let Some(h) = pending.pop() {
+            if !seen.insert(h) {
+                continue;
+            }
+            pending.extend(
+                h.all_neighbors()
+                    .into_iter()
+                    .filter(|n| water.contains(n) && !seen.contains(n)),
+            );
+        }
+        assert_eq!(water.len(), seen.len());
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_prevents_generation_and_cache_publication() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cache = Cache::new(dir.path().into())?;
+        let context = JobContext::default();
+        context.cancel();
+        assert!(generate(&GenerationSettings::default(), &cache, &context).is_err());
+        assert_eq!(std::fs::read_dir(dir.path())?.count(), 0);
+        Ok(())
+    }
+}
