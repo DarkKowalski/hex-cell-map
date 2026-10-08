@@ -67,7 +67,9 @@ def main():
     for pack in sources["packs"]:
         data = download(pack["url"], CACHE / (pack["id"] + ".zip"), pack["sha256"])
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            (ART / (pack["id"] + "-LICENSE.txt")).write_bytes(archive.read("License.txt"))
+            notice = archive.read("License.txt").decode("utf-8-sig")
+            notice = "\n".join(line.rstrip() for line in notice.splitlines()).strip() + "\n"
+            (ART / (pack["id"] + "-LICENSE.txt")).write_text(notice, encoding="utf-8")
             for kind, names in pack["models"].items():
                 for name in names:
                     original = pack["folder"] + name + ".glb"

@@ -1,10 +1,8 @@
-	
-
-	City Kit Suburban (2.0)
+City Kit Suburban (2.0)
 
 	Created/distributed by Kenney (www.kenney.nl)
 	Creation date: 23-04-2025 20:22
-	
+
 			------------------------------
 
 	License: (Creative Commons Zero, CC0)
@@ -20,7 +18,7 @@
 	• Donate  : www.kenney.nl/donate
 
 	• Patreon : patreon.com/kenney
-	
+
 	Follow on social media for updates:
 
 	• Twitter:	 twitter.com/KenneyNL

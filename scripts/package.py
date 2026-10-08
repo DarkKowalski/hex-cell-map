@@ -70,6 +70,7 @@ def main():
     windows = sys.platform == "win32"
     if not apple and not windows:
         raise RuntimeError("MVP release packaging supports macOS and Windows")
+    command(sys.executable, "scripts/import_art.py", "--verify")
     package = dist / ("Hex Cell Map.app" if apple else "hex-cell-map-windows-x64")
     if package.exists():
         shutil.rmtree(package)
@@ -91,6 +92,7 @@ def main():
     for name in ["NOTICE.md", "README.md"]:
         shutil.copy2(ROOT / name, data_dir / name)
     shutil.copytree(ROOT / "docs", data_dir / "docs")
+    shutil.copytree(ROOT / "assets", data_dir / "assets")
     dependency_notices(data_dir)
     if apple:
         with (package / "Contents/Info.plist").open("wb") as stream:

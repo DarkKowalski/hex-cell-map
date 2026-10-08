@@ -5,10 +5,12 @@ Validated on macOS Apple Silicon with an Apple M2 GPU using Bevy's Metal backend
 ## Build and regression checks
 
 - `cargo build --locked --bins` passes.
-- `cargo test --locked --all-targets` passes all 21 tests.
+- `cargo test --locked --all-targets` passes all 24 tests.
 - `cargo clippy --locked --all-targets -- -D warnings` passes.
 
-Regression coverage includes complete shared hex boundary subdivisions, matching chunk vertices/normals after elevation edits, single water coverage at bends and lake crossings, downstream propagation through complete water bodies, preserved GIS elevations, adaptive relief, live display-height alignment, urban edits, undo/redo, offline snapshots, cancellation, stale-job rejection and UI input capture. An outline test toggles cached assets 120 times without rebuilding lines or increasing the asset count, and checks distant-zoom hiding.
+Regression coverage includes complete shared hex boundary subdivisions, matching chunk vertices/normals after elevation edits, single water coverage at bends and lake crossings, downstream propagation through complete water bodies, preserved GIS elevations, adaptive relief, live display-height alignment, urban edits, undo/redo, offline snapshots, cancellation, stale-job rejection and UI input capture. An outline test toggles cached assets 120 times without rebuilding lines or increasing the asset count, and checks distant-zoom hiding. Art checks verify hydrated model/texture hashes, independent texture-array mip chains, dry-ground model anchors, urban building counts and tree placement restricted to forest land cells even when other cells retain high GIS forest fractions.
+
+`python3 scripts/import_art.py --verify` validates all 20 runtime files, including 17 original GLB models. `git lfs ls-files` lists every binary model and image, the Git index contains LFS pointers, and `git lfs fsck` passes. The committed source inventory includes CC0 notices, original download URLs and checksums.
 
 ## Automatically acquired real GIS maps
 
@@ -24,7 +26,9 @@ Each region passes settlement containment, river cell-chain connectivity, comple
 
 ## Native render checks
 
-Each region completes a native screenshot capture and 32 terrain picks on chunk-boundary slopes. Hudson and Yangtze render with hex outlines enabled; Alps renders with outlines disabled. Captures were visually inspected for water overlaps, stretched shore triangles and open hex seams. The native logs contain no shader compilation errors or panics. Frame-rate targets across all supported map sizes still require release profiling.
+Each region completes a native screenshot capture and 32 terrain picks on chunk-boundary slopes. Every native run loads 17 imported GLB prefabs and the two four-layer Poly Haven arrays; the smoke check confirms that all environmental mesh handles belong to imported prefabs. Full-region Hudson and Yangtze checks include cached outlines. Focused Alps and Hudson captures inspect foliage, rocks, ground detail and building clusters at 16 km and 12 km camera distances respectively. The current placement produces 13,038 model parts in the Alps, 61,490 in Hudson and 58,946 in Yangtze; parts sharing mesh/material handles can batch together.
+
+Captures were visually inspected for model appearance, water overlaps, stretched shore triangles and open hex seams. The native logs contain no shader compilation errors or panics. Frame-rate targets across all supported map sizes still require release profiling.
 
 To reproduce after building:
 
@@ -35,10 +39,12 @@ To reproduce after building:
 ./target/debug/hex-cell-map --preview target/validation/alps.json --smoke --screenshot target/validation/alps.png
 ./target/debug/hex-cell-map --preview target/validation/hudson.json --smoke --outlines --screenshot target/validation/hudson.png
 ./target/debug/hex-cell-map --preview target/validation/yangtze.json --smoke --outlines --screenshot target/validation/yangtze.png
+./target/debug/hex-cell-map --preview target/validation/alps.json --smoke --focus -7 8 --distance 16 --screenshot target/validation/alps-art-close.png
+./target/debug/hex-cell-map --preview target/validation/hudson.json --smoke --focus 4 -12 --distance 12 --screenshot target/validation/hudson-art-close.png
 ```
 
 Local logs and screenshots are generated under `target/validation/` and are not committed. A successful smoke run must include both `SMOKE: native frame captured` in its log and the resulting PNG; closing the window early does not satisfy the check.
 
 ## Development package
 
-`python3 scripts/package.py` produces an ad-hoc signed macOS bundle with both binaries, PROJ data, documentation and dependency notices. The package check passes with projection-data environment overrides removed: bundled GDAL 3.12.1 supplies the required GTiff, Shapefile, GeoJSON and MEM drivers, and the PROJ round trip passes. The binary dependency scan finds only system dynamic libraries. Release signing/notarization and installation on a separate clean machine remain pending.
+`python3 scripts/package.py` verifies art hashes and produces an ad-hoc signed macOS bundle with both binaries, all 20 runtime art files, PROJ data, documentation and dependency notices. The package check passes with projection-data environment overrides removed: bundled GDAL 3.12.1 supplies the required GTiff, Shapefile, GeoJSON and MEM drivers, and the PROJ round trip passes. The packaged desktop executable also completes the focused Hudson art capture and 32 terrain picks when launched from `dist/`, loading bundled models and textures from its Resources directory. The binary dependency scan finds only system dynamic libraries. Release signing/notarization and installation on a separate clean machine remain pending.
