@@ -1,0 +1,37 @@
+name: Native checks
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Windows build dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install sqlite cmake llvm --no-progress -y
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+      - name: macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo build --locked --bins
+      - run: python scripts/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ runner.os }}
+          path: dist/
