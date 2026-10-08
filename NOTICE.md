@@ -10,3 +10,11 @@ Generated documents retain input URLs, versions, timestamps, hashes, credits, an
 - **Mozilla certificate roots**: `assets/cacert.pem`, obtained from [curl's Mozilla CA extract](https://curl.se/docs/caextract.html). Mozilla certificate-store data is distributed under [MPL 2.0](https://www.mozilla.org/MPL/2.0/).
 
 Native dependencies include GDAL (MIT-style license), PROJ (MIT-style license), SQLite (public domain), libcurl (curl license), OpenSSL (Apache 2.0 on Unix builds), and zlib (zlib license). Rust dependencies retain their own licenses. Release packaging includes notices from the resolved source dependencies.
+
+## Bundled art
+
+- **Kenney Nature Kit 2.1**: Imported trees, bushes, rocks and grass from the [Nature Kit](https://kenney.nl/assets/nature-kit). [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/); the archive's original notice is retained in `assets/art/nature-LICENSE.txt`.
+- **Kenney City Kit Suburban 2.0**: Five building variants and the shared color atlas from [City Kit (Suburban)](https://kenney.nl/assets/city-kit-suburban). CC0 1.0; the archive's original notice is retained in `assets/art/city-LICENSE.txt`.
+- **Poly Haven**: Grass Ground, Brown Mud Dry, Gravel Ground 01 and Rock Face 03 diffuse, OpenGL normal and ARM maps, packed into terrain arrays. [CC0 license and redistribution terms](https://polyhaven.com/license). Asset pages, authors, download URLs and hashes are recorded in `assets/art/sources.json` and `assets/art/manifest.json`.
+
+These art licenses permit commercial use and redistribution. The source meshes retain their original geometry. Runtime normalization and palette grading adapt them to the map; texture channel packing preserves the supplied material detail. See [the art pipeline](docs/art-assets.md) for the selected files and processing steps. Art files are stored using Git LFS and included in native packages.

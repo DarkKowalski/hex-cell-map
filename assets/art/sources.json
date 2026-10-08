@@ -1,0 +1,158 @@
+{
+  "packs": [
+    {
+      "id": "nature",
+      "page": "https://kenney.nl/assets/nature-kit",
+      "url": "https://kenney.nl/media/pages/assets/nature-kit/37ac38a37b-1677698939/kenney_nature-kit.zip",
+      "sha256": "fa7974a0d342bfe63c38664ba9f8ec1a4aab8ea25f099bdc56870e33588c4d9d",
+      "folder": "Models/GLTF format/",
+      "models": {
+        "tree": [
+          "tree_oak",
+          "tree_detailed",
+          "tree_default"
+        ],
+        "conifer": [
+          "tree_pineRoundA",
+          "tree_pineTallA"
+        ],
+        "shrub": [
+          "plant_bushDetailed",
+          "plant_bushLarge"
+        ],
+        "rock": [
+          "rock_largeA",
+          "rock_largeC",
+          "rock_tallA"
+        ],
+        "grass": [
+          "grass_large",
+          "grass_leafs"
+        ]
+      },
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "city",
+      "page": "https://kenney.nl/assets/city-kit-suburban",
+      "url": "https://kenney.nl/media/pages/assets/city-kit-suburban/2c871b7af2-1745479373/kenney_city-kit-suburban_20.zip",
+      "sha256": "5869c35cf30b1c87bdb2d197b6d325eebadd2ef08ea27f04797e8e08d77a9a39",
+      "folder": "Models/GLB format/",
+      "models": {
+        "building": [
+          "building-type-a",
+          "building-type-h",
+          "building-type-k",
+          "building-type-r",
+          "building-type-u"
+        ]
+      },
+      "license": "CC0-1.0"
+    }
+  ],
+  "textures": [
+    {
+      "id": "grass_ground",
+      "page": "https://polyhaven.com/a/grass_ground",
+      "license": "CC0-1.0",
+      "authors": {
+        "Charlotte Baglioni": "All"
+      },
+      "files": {
+        "Diffuse": {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/grass_ground/grass_ground_diff_1k.jpg",
+          "md5": "299047258586c762735b7284d3c662c3",
+          "size": 876584
+        },
+        "nor_gl": {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/grass_ground/grass_ground_nor_gl_1k.jpg",
+          "md5": "d518c5b2af6f2c0297bc807b351f511f",
+          "size": 1310516
+        },
+        "arm": {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/grass_ground/grass_ground_arm_1k.jpg",
+          "md5": "e0499d084eaddc110671ebfee26bd941",
+          "size": 896135
+        }
+      }
+    },
+    {
+      "id": "brown_mud_dry",
+      "page": "https://polyhaven.com/a/brown_mud_dry",
+      "license": "CC0-1.0",
+      "authors": {
+        "Rob Tuytel": "All"
+      },
+      "files": {
+        "Diffuse": {
+          "size": 920456,
+          "md5": "0c0ad82fec60f091690c69c23657cb74",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/brown_mud_dry/brown_mud_dry_diff_1k.jpg"
+        },
+        "nor_gl": {
+          "size": 1539092,
+          "md5": "a842517bea5187ccbceb69fd26629d1e",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/brown_mud_dry/brown_mud_dry_nor_gl_1k.jpg"
+        },
+        "arm": {
+          "size": 242778,
+          "md5": "937b4aa85665324b811deb7a2b787ffd",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/brown_mud_dry/brown_mud_dry_arm_1k.jpg"
+        }
+      }
+    },
+    {
+      "id": "gravel_ground_01",
+      "page": "https://polyhaven.com/a/gravel_ground_01",
+      "license": "CC0-1.0",
+      "authors": {
+        "Rob Tuytel": "All"
+      },
+      "files": {
+        "Diffuse": {
+          "size": 954257,
+          "md5": "ee99ef89fb50cfeb198db369bb7151f0",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/gravel_ground_01/gravel_ground_01_diff_1k.jpg"
+        },
+        "nor_gl": {
+          "size": 1314248,
+          "md5": "8a54072ce38665da29081d57dc10cb69",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/gravel_ground_01/gravel_ground_01_nor_gl_1k.jpg"
+        },
+        "arm": {
+          "size": 151288,
+          "md5": "1d4ee24a4dc226c24a2e8b5701c31797",
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/gravel_ground_01/gravel_ground_01_arm_1k.jpg"
+        }
+      }
+    },
+    {
+      "id": "rock_face_03",
+      "page": "https://polyhaven.com/a/rock_face_03",
+      "license": "CC0-1.0",
+      "authors": {
+        "Dario Barresi": "Photography",
+        "Rico Cilliers": "Processing"
+      },
+      "files": {
+        "Diffuse": {
+          "size": 927082,
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/rock_face_03/rock_face_03_diff_1k.jpg",
+          "md5": "e4c34abb1aad5befe12754fad507147a"
+        },
+        "nor_gl": {
+          "size": 1146788,
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/rock_face_03/rock_face_03_nor_gl_1k.jpg",
+          "md5": "cbd30858439ece391480c5e67e09de89"
+        },
+        "arm": {
+          "size": 793241,
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/rock_face_03/rock_face_03_arm_1k.jpg",
+          "md5": "351c58daba868568fb5a191194aa5302"
+        }
+      }
+    }
+  ],
+  "texture_license": "https://polyhaven.com/license",
+  "texture_api": "https://polyhaven.com/our-api"
+}

@@ -1,0 +1,337 @@
+{
+  "version": 1,
+  "license": "CC0-1.0",
+  "models": [
+    {
+      "path": "art/kenney_nature/tree_oak.glb",
+      "kind": "tree",
+      "triangles": 196
+    },
+    {
+      "path": "art/kenney_nature/tree_detailed.glb",
+      "kind": "tree",
+      "triangles": 402
+    },
+    {
+      "path": "art/kenney_nature/tree_default.glb",
+      "kind": "tree",
+      "triangles": 114
+    },
+    {
+      "path": "art/kenney_nature/tree_pineRoundA.glb",
+      "kind": "conifer",
+      "triangles": 204
+    },
+    {
+      "path": "art/kenney_nature/tree_pineTallA.glb",
+      "kind": "conifer",
+      "triangles": 78
+    },
+    {
+      "path": "art/kenney_nature/plant_bushDetailed.glb",
+      "kind": "shrub",
+      "triangles": 104
+    },
+    {
+      "path": "art/kenney_nature/plant_bushLarge.glb",
+      "kind": "shrub",
+      "triangles": 60
+    },
+    {
+      "path": "art/kenney_nature/rock_largeA.glb",
+      "kind": "rock",
+      "triangles": 80
+    },
+    {
+      "path": "art/kenney_nature/rock_largeC.glb",
+      "kind": "rock",
+      "triangles": 72
+    },
+    {
+      "path": "art/kenney_nature/rock_tallA.glb",
+      "kind": "rock",
+      "triangles": 136
+    },
+    {
+      "path": "art/kenney_nature/grass_large.glb",
+      "kind": "grass",
+      "triangles": 224
+    },
+    {
+      "path": "art/kenney_nature/grass_leafs.glb",
+      "kind": "grass",
+      "triangles": 36
+    },
+    {
+      "path": "art/kenney_city/building-type-a.glb",
+      "kind": "building",
+      "triangles": 1174
+    },
+    {
+      "path": "art/kenney_city/building-type-h.glb",
+      "kind": "building",
+      "triangles": 770
+    },
+    {
+      "path": "art/kenney_city/building-type-k.glb",
+      "kind": "building",
+      "triangles": 1024
+    },
+    {
+      "path": "art/kenney_city/building-type-r.glb",
+      "kind": "building",
+      "triangles": 1030
+    },
+    {
+      "path": "art/kenney_city/building-type-u.glb",
+      "kind": "building",
+      "triangles": 1332
+    }
+  ],
+  "files": [
+    {
+      "path": "art/kenney_nature/tree_oak.glb",
+      "sha256": "d7fd8773674928c50c11b66d12c636d49bdcc15a8b1c7fbb98e6f63a3439a3f3",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/tree_oak.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/tree_detailed.glb",
+      "sha256": "c041daf2f0fb1d49e4325227cbcd58667adbe51e9b55e8c1f0a94b74cc521b3b",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/tree_detailed.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/tree_default.glb",
+      "sha256": "562d29638c902de3c7bee465d3a53bb77117efbc392ae04ed894faf6b5dc691d",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/tree_default.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/tree_pineRoundA.glb",
+      "sha256": "7dc9711f31585eafdcb965d0649c30af5e19f2def1955f7a915081d30759ef8e",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/tree_pineRoundA.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/tree_pineTallA.glb",
+      "sha256": "e0a56eb196d8a64ba86c7304d607136e17e6f9ad748dffcf86bd53b18b91b196",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/tree_pineTallA.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/plant_bushDetailed.glb",
+      "sha256": "2e0487020d68ccf664435db9d829c78ae00e6d2785ee3ec10b9f89cc70a10406",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/plant_bushDetailed.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/plant_bushLarge.glb",
+      "sha256": "10e1d9fbf29d96d1d1a56fb2ce25ae66537505101759229afe01ae22c6c45e02",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/plant_bushLarge.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/rock_largeA.glb",
+      "sha256": "6dd15390fd96501dcd1454765a17ba61dbbd8d47705dfe5149c8dd92b353ce25",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/rock_largeA.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/rock_largeC.glb",
+      "sha256": "23aee8b727adeaf260207af3e0615dc69aa766c6d87de1d44cbc8c2711d74dd1",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/rock_largeC.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/rock_tallA.glb",
+      "sha256": "88250f236a3b75f8b55c1d8afb6af020f8a91b1e81f9fb51f7ef513420d45a2d",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/rock_tallA.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/grass_large.glb",
+      "sha256": "af49a595624abca7249824eeefb944d4baf974abeeb5b16110d175da3563d6cd",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/grass_large.glb"
+      }
+    },
+    {
+      "path": "art/kenney_nature/grass_leafs.glb",
+      "sha256": "8bc4c0b17c2e64c34e1acbf7c4a2fd8c04cfcd7155328e61767887b2ced112c7",
+      "source": {
+        "pack": "nature",
+        "entry": "Models/GLTF format/grass_leafs.glb"
+      }
+    },
+    {
+      "path": "art/kenney_city/building-type-a.glb",
+      "sha256": "49f32e20b9dcd24b1c8f6d6488807b8c8cb684cbb595bfb0bb36ad903e470faa",
+      "source": {
+        "pack": "city",
+        "entry": "Models/GLB format/building-type-a.glb"
+      }
+    },
+    {
+      "path": "art/kenney_city/Textures/colormap.png",
+      "sha256": "9b5de86078c25ef02351a80d35ff3c978693a1044565b73eedd9ae9b5b80665d",
+      "source": {
+        "pack": "city",
+        "entry": "Models/GLB format/Textures/colormap.png"
+      }
+    },
+    {
+      "path": "art/kenney_city/building-type-h.glb",
+      "sha256": "b8b8eb7a50f85fa20b4862723e133157f553d69a0daad39b850ddbd2099ebb84",
+      "source": {
+        "pack": "city",
+        "entry": "Models/GLB format/building-type-h.glb"
+      }
+    },
+    {
+      "path": "art/kenney_city/building-type-k.glb",
+      "sha256": "c1b819a526bbcf9663bc40c98e22337cded7fff7c50c14679132d5d98d75f583",
+      "source": {
+        "pack": "city",
+        "entry": "Models/GLB format/building-type-k.glb"
+      }
+    },
+    {
+      "path": "art/kenney_city/building-type-r.glb",
+      "sha256": "9b76ee3b9061b680ca14fd8cc838d1d5ca91b959e02833254f15d9236b8b20b7",
+      "source": {
+        "pack": "city",
+        "entry": "Models/GLB format/building-type-r.glb"
+      }
+    },
+    {
+      "path": "art/kenney_city/building-type-u.glb",
+      "sha256": "fb259246fc73bdce626eed8b7167d5e97bd63651890551661ec4507311eba279",
+      "source": {
+        "pack": "city",
+        "entry": "Models/GLB format/building-type-u.glb"
+      }
+    },
+    {
+      "path": "art/polyhaven/ground-color.png",
+      "sha256": "988af5336ff61d5fce66d2ae1c3035734de31609b09cd28e82e1c0501b078f0a",
+      "source": {
+        "layers": [
+          "grass_ground",
+          "brown_mud_dry",
+          "gravel_ground_01",
+          "rock_face_03"
+        ],
+        "processing": "Pillow 12.1.0, RGBA vertical array packing"
+      }
+    },
+    {
+      "path": "art/polyhaven/ground-detail.png",
+      "sha256": "7b7468819e2cc72fa7c35353bba918ba96544f1723d68ca1cc64dc6c41fd86bc",
+      "source": {
+        "layers": [
+          "grass_ground",
+          "brown_mud_dry",
+          "gravel_ground_01",
+          "rock_face_03"
+        ],
+        "processing": "Pillow 12.1.0, RGBA vertical array packing"
+      }
+    }
+  ],
+  "texture_layers": [
+    {
+      "id": "grass_ground",
+      "layer": 0,
+      "downloads": [
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/grass_ground/grass_ground_diff_1k.jpg",
+          "sha256": "a79cc5ed65af0f80261b39a383b64a8c5272c5144d724deb43dbc29f0e4cd19b"
+        },
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/grass_ground/grass_ground_nor_gl_1k.jpg",
+          "sha256": "7000e2ccd479bb7b66dcdf4faef7b47554324566886314ca620cbf03e274e826"
+        },
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/grass_ground/grass_ground_arm_1k.jpg",
+          "sha256": "b8c13e5972827dda6465fc98bbb8b3a0e67215bf8e864c729072fc9c1cc502ef"
+        }
+      ]
+    },
+    {
+      "id": "brown_mud_dry",
+      "layer": 1,
+      "downloads": [
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/brown_mud_dry/brown_mud_dry_diff_1k.jpg",
+          "sha256": "a56281b644de614787340f3db45e28d2f72ec32fc19a442f99002bae0ab11398"
+        },
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/brown_mud_dry/brown_mud_dry_nor_gl_1k.jpg",
+          "sha256": "4dd82ecb3e810d4de49d34c7d6cc30152129434a58b3bd786bc9952bc8874877"
+        },
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/brown_mud_dry/brown_mud_dry_arm_1k.jpg",
+          "sha256": "4521708cf2976046be3c8f968c5e64e32aa269f5fb9d04b2360269f9f49b9861"
+        }
+      ]
+    },
+    {
+      "id": "gravel_ground_01",
+      "layer": 2,
+      "downloads": [
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/gravel_ground_01/gravel_ground_01_diff_1k.jpg",
+          "sha256": "c3a12b0e3a9399913158dd5cfa1d67ede066970acd1f99e5b89969ac13f89089"
+        },
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/gravel_ground_01/gravel_ground_01_nor_gl_1k.jpg",
+          "sha256": "3a832b27276d1457031b164147434558bd245469dc27fd1ff6ae075bde0b12b2"
+        },
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/gravel_ground_01/gravel_ground_01_arm_1k.jpg",
+          "sha256": "cf78bb8dd9c0079874ebceba2cbb58fc3eccf03d84204b3fccdcf0549b808e03"
+        }
+      ]
+    },
+    {
+      "id": "rock_face_03",
+      "layer": 3,
+      "downloads": [
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/rock_face_03/rock_face_03_diff_1k.jpg",
+          "sha256": "ea48e0e47ad42c8bd312476178b1248ec66f0eb19156a26a1c222f2a40caaf2d"
+        },
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/rock_face_03/rock_face_03_nor_gl_1k.jpg",
+          "sha256": "c6423169583f31715cf0636954bad524e806848a5f2861fcea6794275f726ff0"
+        },
+        {
+          "url": "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k/rock_face_03/rock_face_03_arm_1k.jpg",
+          "sha256": "a1f8e60eaf4f119071840e36e165d3a9185be62bd3ac7068ab6d886aa639d29f"
+        }
+      ]
+    }
+  ]
+}
