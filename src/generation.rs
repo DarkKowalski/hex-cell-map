@@ -100,8 +100,8 @@ pub fn generate(
     let height_field =
         source_height_field(&cells, spacing, &projection, &elevation, &cover, context)?;
     let mut document = MapDocument {
-        schema_version: 1,
-        generator_version: "gis-hex-v2".into(),
+        schema_version: 2,
+        generator_version: "gis-hex-v3".into(),
         settings: settings.clone(),
         projection_wkt: projection.wkt,
         bounds_m,
@@ -109,6 +109,8 @@ pub fn generate(
         sources,
         river_network: river_network.into_values().collect(),
         height_field,
+        river_paths: rivers,
+        heights: HeightSettings::default(),
         index,
     };
     document.rebuild_index()?;
@@ -157,6 +159,7 @@ fn source_height_field(
         "Continuous DEM surface exceeds sample limit"
     );
     let mut elevations_m = Vec::with_capacity(width * height);
+    let mut land_cover = Vec::with_capacity(width * height);
     for row in 0..height {
         context.check()?;
         let mut positions: Vec<_> = (0..width)
@@ -176,6 +179,11 @@ fn source_height_field(
                     format!("Missing continuous DEM coverage at {lat:.5}°, {lon:.5}°")
                 })?;
             elevations_m.push(value as f32);
+            land_cover.push(
+                cover
+                    .sample(lon, lat)
+                    .context("Missing surface land cover")? as u8,
+            );
         }
     }
     Ok(HeightField {
@@ -184,6 +192,7 @@ fn source_height_field(
         width,
         height,
         elevations_m,
+        land_cover,
     })
 }
 
@@ -343,6 +352,15 @@ pub fn assign_cities(
     }
     for cell in cells {
         cell.cities.sort_by_key(|c| c.id);
+        if !cell.cities.is_empty() {
+            cell.urban = Some(UrbanTerrain {
+                population: cell.cities.iter().map(|c| c.population).sum(),
+                style: UrbanStyle::Mixed,
+            });
+            if cell.surface == Surface::Land {
+                cell.surface = Surface::City;
+            }
+        }
     }
     Ok(())
 }

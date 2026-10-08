@@ -2,7 +2,7 @@
 
 Build a PC-native GIS-driven 3D hexagonal map generator and visual editor using Rust and Bevy. Users select a real geographic region, configure hex spacing, automatically generate a map from real GIS data, edit it visually, and reliably save and reload their work.
 
-Implementation is authorized through **M2**. The research baseline is **8 October 2026**. The headless GIS foundation builds on macOS and automatically decodes all four sources for a 2,089-cell Swiss Alps region. Native packaging, deterministic generation validation, and rendering are being completed against the acceptance gates below. Local commits record working checkpoints.
+Implementation covers **M0–M2**, plus the requested river integration, GIS-driven materials, urban-cell editing, nonlinear display heights and persisted settings. Native Windows packaging and clean-machine checks remain acceptance gates. Local commits record working checkpoints. The research baseline is **8 October 2026**.
 
 ## Scope and constraints
 
@@ -99,7 +99,7 @@ Use a dense collection of cells with stable integer IDs. Each cell retains:
 - Settlement records and other supported features.
 - Whether values were generated or edited.
 
-This separation allows a city and river to coexist in one hex without losing either record. A river cell's rendered surface remains river terrain, with a settlement marker retained where necessary. Future roads can be added as another feature without restructuring the terrain model.
+This separation allows a city and river to coexist in one hex without losing either record. River and open-water classifications take priority over the urban surface classification. Urban coverage and building clusters can coexist with a river cell on dry ground; source settlements stay attached to their original containing hex. Future roads can be added as another feature without restructuring the terrain model.
 
 ### Generation pipeline
 
@@ -120,21 +120,21 @@ Land-cover values are categorical. Use nearest-neighbor or mode processing, foll
 
 Intersect river line segments with hex polygons and include every crossed cell. Resolve exact boundary cases deterministically to preserve connected cell chains. Retain river IDs and connectivity metadata. Expose a river-importance threshold based on discharge or stream order; including every tributary at theater scale could turn much of the map into river terrain.
 
-Whole-cell rivers exaggerate geographic width at these hex sizes. Preserve approximate location and connectivity rather than claiming literal river widths. Missing land elevation must never be interpreted as sea-level terrain. Assign sea level only where input data establish open water.
+River classification occupies complete cells for editing and selection. Visible water follows retained GIS centerlines with symbolic width, independent of hex edges. Preserve source location and connectivity rather than claiming literal channel widths. Missing land elevation must never be interpreted as sea-level terrain. Assign sea level only where input data establish open water.
 
 ### Continuous terrain and environmental models
 
-- Start with **32 × 32-cell chunks**.
-- Triangulate cell interiors and transition bands into a continuous surface.
-- Derive shared edge and corner heights from canonical neighboring-cell data.
-- Compute consistent normals across chunk boundaries using a small halo.
-- Blend grass, forest-floor, and rock materials through one small PBR material extension.
-- Keep river-cell interiors clearly recognizable as water.
-- Rebuild affected chunks and the neighbors needed for seam calculations.
-- Generate CPU mesh data in background jobs and apply completed assets on the main thread.
-- Tag jobs with document revisions so stale results cannot overwrite newer edits.
-- Use shared mesh and material handles for tree and building models so Bevy can instance them.
-- Start with sparse placements, frustum culling, and distance-based hiding. Introduce custom GPU instancing only if profiling justifies it.
+- Use **32 × 32-cell chunks** and a separate projected source DEM height field. Subdivide terrain within hex ownership boundaries; terrain shape follows the source field rather than cell means.
+- Retain source WorldCover classes at projected samples. Blend vegetation, crop, bare ground, urban, wetland and snow/ice colors, with rock exposure driven by source slope. Add subtle multi-scale procedural tint and grain; procedural variation does not replace GIS classification.
+- Retain HydroRIVERS polylines and downstream metadata. Derive bounded downhill water profiles and locally carved beds/banks. Refine meshes near channels; render water as separate gentle ribbons. Derive lake and coastal shorelines from the source open-water mask.
+- Use globally canonical local-coordinate vertices and consistent normal sampling across chunks. Keep every rendered triangle assigned to its logical hex for selection.
+- Apply the monotone display transform `sign(h) × scale × compression × ln(1 + abs(h)/compression)` to terrain and water together. Default scale is 1 and compression is 500 m. Keep original elevations, edited elevations and display settings separate.
+- Represent urban terrain at cell level. Retain all original settlement records in the containing hex, derive initial population from their sum, and generate symbolic building clusters and streets. River cells retain their hydrological identity; skip buildings on visible water.
+- Generate CPU mesh data on one cancellable worker and install complete, current revisions on the main thread. Revision tags prevent stale jobs from replacing newer views.
+- Reuse mesh/material handles for environmental models. Start with bounded tree density and distance hiding; profile before adding custom instancing or adaptive LOD.
+- Self-contained snapshots include source fields, river paths, cells, display settings and provenance. General terrain tools, broader project workflow and performance gates follow in M3–M6.
+
+HydroRIVERS is derived from approximately 500 m source hydrography; its paths can disagree with a finer DEM. Local bed conditioning preserves path coordinates while adapting the rendered terrain around them. This is a visual channel representation, with discharge-informed symbolic width, rather than a hydraulic simulation. [HydroRIVERS technical documentation](https://data.hydrosheds.org/file/technical-documentation/HydroRIVERS_TechDoc_v10.pdf)
 
 ## Required MVP and deferred features
 
@@ -160,7 +160,7 @@ Whole-cell rivers exaggerate geographic width at these hex sizes. Preserve appro
 | Large raster downloads | Batch COG window reads and cache regional working rasters. [GDAL virtual filesystem documentation](https://gdal.org/en/stable/user/virtual_file_systems.html) | Download whole intersecting tiles automatically within a visible size budget. |
 | Missing data or provider outages | Validate coverage separately from network failures; retry or use complete cached data. | Fail generation clearly without replacing the current map or fabricating terrain. |
 | River density and disconnected rasterization | Validate connected cell chains and calibrate importance thresholds at several hex sizes. | Raise the threshold and simplify source lines while retaining source-derived locations. |
-| DEM and river misalignment | Keep elevation and river classification separate; test steep valleys and junctions early. | Use terrain-following river surfaces with simple bank transitions. Defer hydraulic correction. |
+| DEM and river misalignment | Retain centerlines and topology; condition gentle water profiles and carve localized beds/banks. Validate steep valleys and junctions. | Reduce the selected river density or symbolic width; fail invalid geometry visibly. Full hydraulic simulation is deferred. |
 | Chunk seams and expensive edits | Canonical boundary calculations, halo data, and revision-tagged background rebuilds | Reduce mesh subdivision and rebuild frequency while retaining continuous terrain. |
 | Rendering performance | Limit environmental density, reuse assets, cull chunks, and profile actual maps. | Reduce decorative density and shadow cost before increasing architectural complexity. |
 | Dataset age and licensing | Record dates, sources, transformations, and applicable terms in every project. | Keep raw caches outside project files and preserve required conditions for derived data. HydroRIVERS redistribution needs particular attention. |
@@ -210,7 +210,10 @@ Add chunk meshes, shared boundary calculations, smooth shading, material blendin
 
 - Adjacent chunks have matching boundary positions and normals, including after a boundary elevation change.
 - Plains, forests, mountains, rivers, and cities remain distinguishable at useful zoom levels.
-- Rivers visibly occupy cell interiors.
+- River classifications occupy dedicated cells; visible channels follow source paths through cell interiors without coating slopes or showing hex-shaped water boundaries.
+- Display compression preserves elevation order and aligns terrain, water, models and picking. Original GIS elevations are unchanged.
+- Urban cells have ground coverage and population-scaled building clusters; river conflicts retain hydrological identity.
+- Source-based material blending distinguishes bare rock, vegetation, cropland, urban ground and snow/ice.
 - Panning, 360° yaw rotation, and smooth bounded zoom work with mouse and trackpad.
 - Terrain picking selects the correct cell on slopes and near chunk boundaries.
 - UI interaction does not move the camera or select terrain.

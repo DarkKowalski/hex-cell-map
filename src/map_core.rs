@@ -196,6 +196,7 @@ pub enum Surface {
     Land,
     River,
     Water,
+    City,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -223,7 +224,74 @@ pub struct Cell {
     pub surface: Surface,
     pub river_ids: Vec<u64>,
     pub cities: Vec<City>,
+    #[serde(default)]
+    pub urban: Option<UrbanTerrain>,
     pub edited: bool,
+}
+
+/// Urban classification is editable; source settlement records remain unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum UrbanStyle {
+    #[default]
+    Mixed,
+    LowRise,
+    Dense,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UrbanTerrain {
+    pub population: u64,
+    pub style: UrbanStyle,
+}
+
+/// Monotone display transform; never applied to stored GIS elevations.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct HeightSettings {
+    pub scale: f32,
+    pub compression_m: f64,
+}
+impl Default for HeightSettings {
+    fn default() -> Self {
+        Self {
+            scale: 1.,
+            compression_m: 500.,
+        }
+    }
+}
+impl HeightSettings {
+    pub fn validate(self) -> Result<()> {
+        ensure!(
+            self.scale.is_finite()
+                && (0.2..=2.).contains(&self.scale)
+                && self.compression_m.is_finite()
+                && (100. ..=5000.).contains(&self.compression_m),
+            "Invalid display height settings"
+        );
+        Ok(())
+    }
+    pub fn inverse_meters(self, height: f64) -> f64 {
+        height.signum()
+            * self.compression_m
+            * (height.abs() / (f64::from(self.scale) * self.compression_m)).exp_m1()
+    }
+    pub fn derivative(self, elevation: f64) -> f64 {
+        f64::from(self.scale) / (1. + elevation.abs() / self.compression_m)
+    }
+    pub fn meters(self, elevation: f64) -> f64 {
+        elevation.signum()
+            * f64::from(self.scale)
+            * self.compression_m
+            * (elevation.abs() / self.compression_m).ln_1p()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RiverPath {
+    pub id: u64,
+    pub next_down: u64,
+    pub discharge: f64,
+    pub stream_order: u32,
+    pub points_m: Vec<[f64; 2]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -249,6 +317,9 @@ pub struct MapDocument {
     pub sources: Vec<SourceRecord>,
     pub river_network: Vec<RiverRecord>,
     pub height_field: HeightField,
+    pub river_paths: Vec<RiverPath>,
+    #[serde(default)]
+    pub heights: HeightSettings,
     #[serde(skip)]
     pub index: HashMap<Hex, usize>,
 }
@@ -261,9 +332,39 @@ pub struct HeightField {
     pub width: usize,
     pub height: usize,
     pub elevations_m: Vec<f32>,
+    /// WorldCover class at each projected sample, independent of logical hexes.
+    pub land_cover: Vec<u8>,
 }
 
 impl HeightField {
+    pub fn point(&self, index: usize) -> [f64; 2] {
+        [
+            self.origin_m[0] + (index % self.width) as f64 * self.step_m,
+            self.origin_m[1] + (index / self.width) as f64 * self.step_m,
+        ]
+    }
+    pub fn cover_weights(&self, point: [f64; 2]) -> [f64; 11] {
+        let classes = [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100];
+        let x = ((point[0] - self.origin_m[0]) / self.step_m).clamp(0., (self.width - 1) as f64);
+        let y = ((point[1] - self.origin_m[1]) / self.step_m).clamp(0., (self.height - 1) as f64);
+        let ix = (x.floor() as usize).min(self.width - 2);
+        let iy = (y.floor() as usize).min(self.height - 2);
+        let mut result = [0.; 11];
+        for (dx, dy, w) in [
+            (0, 0, (1. - x + ix as f64) * (1. - y + iy as f64)),
+            (1, 0, (x - ix as f64) * (1. - y + iy as f64)),
+            (0, 1, (1. - x + ix as f64) * (y - iy as f64)),
+            (1, 1, (x - ix as f64) * (y - iy as f64)),
+        ] {
+            if let Some(k) = classes
+                .iter()
+                .position(|c| *c == self.land_cover[(iy + dy) * self.width + ix + dx])
+            {
+                result[k] += w;
+            }
+        }
+        result
+    }
     pub fn sample(&self, point: [f64; 2]) -> Option<f64> {
         let x = (point[0] - self.origin_m[0]) / self.step_m;
         let y = (point[1] - self.origin_m[1]) / self.step_m;
@@ -292,21 +393,35 @@ pub struct RiverRecord {
 
 impl MapDocument {
     pub fn rebuild_index(&mut self) -> Result<()> {
+        self.heights.validate()?;
+        self.settings.validate()?;
         let field = &self.height_field;
         ensure!(
             field.width >= 2
                 && field.height >= 2
                 && field.width.checked_mul(field.height) == Some(field.elevations_m.len())
+                && field.elevations_m.len() == field.land_cover.len()
+                && field
+                    .land_cover
+                    .iter()
+                    .all(|c| [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100].contains(c))
                 && field.elevations_m.len() <= 2_000_000
                 && field.step_m.is_finite()
                 && field.step_m > 0.
                 && field.elevations_m.iter().all(|h| h.is_finite()),
             "Invalid source height field"
         );
-        ensure!(self.schema_version == 1, "Unsupported cached map schema");
+        ensure!(self.schema_version == 2, "Unsupported cached map schema");
         ensure!(
             self.cells.len() <= MAX_CELLS && !self.cells.is_empty(),
             "Map has an invalid number of cells"
+        );
+        ensure!(
+            self.river_paths.iter().all(|r| r.discharge.is_finite()
+                && r.discharge >= 0.
+                && r.points_m.len() >= 2
+                && r.points_m.iter().flatten().all(|v| v.is_finite())),
+            "Invalid river geometry"
         );
         self.index.clear();
         for (i, cell) in self.cells.iter().enumerate() {
@@ -479,6 +594,7 @@ pub fn build_grid(
             surface: Surface::Land,
             river_ids: vec![],
             cities: vec![],
+            urban: None,
             edited: false,
         });
     }

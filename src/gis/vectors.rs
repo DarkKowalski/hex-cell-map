@@ -8,7 +8,6 @@ use gdal::{
     Dataset,
     vector::{Geometry, LayerAccess},
 };
-use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, File},
@@ -16,14 +15,7 @@ use std::{
     path::Path,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RiverReach {
-    pub id: u64,
-    pub next_down: u64,
-    pub discharge: f64,
-    pub stream_order: u32,
-    pub points_m: Vec<[f64; 2]>,
-}
+pub use crate::map_core::RiverPath as RiverReach;
 
 pub fn rivers(
     cache: &Cache,

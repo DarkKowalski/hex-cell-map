@@ -99,7 +99,7 @@ fn main() -> Result<()> {
         let second = generation::generate(&settings, &cache, &context)?;
         ensure!(
             digest == cell_digest(&second)?,
-            "Cached regeneration changed canonical cell data"
+            "Cached regeneration changed canonical GIS data"
         );
         println!(
             "Cached repeat identical in {:.2}s",
@@ -121,7 +121,12 @@ fn main() -> Result<()> {
 fn cell_digest(document: &MapDocument) -> Result<String> {
     Ok(format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(&document.cells)?)
+        Sha256::digest(serde_json::to_vec(&(
+            &document.cells,
+            &document.height_field,
+            &document.river_paths,
+            &document.heights
+        ))?)
     ))
 }
 

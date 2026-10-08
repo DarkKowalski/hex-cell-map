@@ -31,13 +31,17 @@ impl Default for OrbitCamera {
 }
 
 impl OrbitCamera {
-    pub fn fit(&mut self, document: &crate::map_core::MapDocument, exaggeration: f32) {
+    pub fn fit(
+        &mut self,
+        document: &crate::map_core::MapDocument,
+        heights: crate::map_core::HeightSettings,
+    ) {
         let b = document.bounds_m;
         let average =
             document.cells.iter().map(|c| c.elevation_m).sum::<f64>() / document.cells.len() as f64;
         self.target_goal = Vec3::new(
             ((b[0] + b[2]) / 2000.) as f32,
-            (average / 1000.) as f32 * exaggeration,
+            (heights.meters(average) / 1000.) as f32,
             (-(b[1] + b[3]) / 2000.) as f32,
         );
         self.distance_goal =
@@ -116,13 +120,8 @@ pub fn animate(
         ];
         let spacing = document.settings.spacing_km * 1000.;
         if let Some(cell) = document.cell(crate::map_core::point_hex(point, spacing))
-            && let Some(height) = crate::terrain::surface_height(
-                cell,
-                point,
-                spacing,
-                view.exaggeration,
-                &view.corners,
-            )
+            && let Some(height) =
+                crate::terrain::surface_height(cell, point, &view.triangles, &view.corners)
         {
             orbit.target_goal.y = height;
         }
@@ -146,13 +145,8 @@ pub fn animate(
         ];
         let spacing = document.settings.spacing_km * 1000.;
         if let Some(cell) = document.cell(crate::map_core::point_hex(point, spacing))
-            && let Some(height) = crate::terrain::surface_height(
-                cell,
-                point,
-                spacing,
-                view.exaggeration,
-                &view.corners,
-            )
+            && let Some(height) =
+                crate::terrain::surface_height(cell, point, &view.triangles, &view.corners)
         {
             position.y = position
                 .y

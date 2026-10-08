@@ -113,8 +113,10 @@ pub fn show(
             ui.strong("View");
             ui.horizontal(|ui| { ui.checkbox(&mut state.models, "Trees & cities"); ui.checkbox(&mut state.grid, "Hex outlines"); });
             if state.grid && view.document.as_ref().is_some_and(|d| d.cells.len() > 12_000) { ui.small("Full outlines are available for maps up to 12,000 hexes."); }
-            if ui.add_enabled(!active, egui::Slider::new(&mut state.exaggeration, 1. ..=12.).text("Height scale").step_by(0.5)).changed() { state.rebuild_requested = true; }
-            if ui.add_enabled(view.document.is_some(), egui::Button::new("Fit map")).clicked() && let Some(document) = &view.document { orbit.fit(document, view.exaggeration); }
+            if ui.add_enabled(!active, egui::Slider::new(&mut state.heights.scale, 0.2..=2.).text("Height scale")).changed() { state.rebuild_requested = true; }
+            if ui.add_enabled(!active, egui::Slider::new(&mut state.heights.compression_m, 100. ..=5000.).logarithmic(true).text("Compression (m)")).changed() { state.rebuild_requested=true; }
+            ui.small("Lower compression values flatten high mountains more. GIS elevations remain unchanged.");
+            if ui.add_enabled(view.document.is_some(), egui::Button::new("Fit map")).clicked() && let Some(document) = &view.document { orbit.fit(document, view.heights); }
             ui.small("Middle drag / Shift + left drag: pan\nRight drag / Q, E: rotate\nWheel / trackpad: zoom · WASD: pan\nLeft click: inspect a hex");
             ui.separator();
             if let Some(document) = &view.document {
@@ -124,7 +126,30 @@ pub fn show(
                 if ui.button("Data sources & credits").clicked() { state.credits = true; }
             }
             ui.add_space(8.);
-            ui.small("Terrain painting and project save/load arrive in the next milestones.");
+            ui.collapsing("Urban cell editor",|ui| {
+                ui.checkbox(&mut state.city_paint,"Paint cities on click");
+                ui.add(egui::Slider::new(&mut state.city_radius,0..=3).text("Brush radius"));
+                ui.horizontal(|ui| {ui.label("Population");ui.add(egui::DragValue::new(&mut state.city_population).range(1000..=100_000_000));});
+                egui::ComboBox::from_id_salt("urban-style").selected_text(format!("{:?}",state.city_style)).show_ui(ui,|ui|{for style in [UrbanStyle::Mixed,UrbanStyle::LowRise,UrbanStyle::Dense]{ui.selectable_value(&mut state.city_style,style,format!("{style:?}"));}});
+                ui.add_enabled_ui(!active && view.selected.is_some(),|ui| {ui.horizontal(|ui|{
+                    if ui.button("Apply city").clicked(){state.edit_requested=Some(true);}
+                    if ui.button("Remove city").clicked(){state.edit_requested=Some(false);}
+                });});
+                ui.small("River cells retain their river identity; urban buildings use dry ground. Source settlements are retained after removal.");
+            });
+            ui.add_enabled_ui(!active,|ui| {ui.horizontal(|ui|{
+                if ui.add_enabled(!state.undo.is_empty(),egui::Button::new("Undo")).clicked(){state.undo_requested=true;}
+                if ui.add_enabled(!state.redo.is_empty(),egui::Button::new("Redo")).clicked(){state.redo_requested=true;}
+            });});
+            ui.collapsing("Project",|ui| {
+                ui.text_edit_singleline(&mut state.project_path);
+                ui.add_enabled_ui(!active,|ui| {ui.horizontal(|ui|{
+                    if ui.add_enabled(view.document.is_some(),egui::Button::new("Save")).clicked(){state.save_requested=true;}
+                    if ui.button("Open").clicked(){state.load_requested=true;}
+                });});
+                ui.small("Self-contained JSON includes source data, height settings and urban edits.");
+            });
+            ui.small("General terrain and elevation brushes arrive in the next milestones.");
         });
     });
     if view.document.is_none() && !active {
@@ -139,7 +164,7 @@ pub fn show(
     if state.credits {
         egui::Window::new("Data sources & credits").open(&mut state.credits).default_width(560.).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height(650.).show(ui, |ui| {
-                ui.label("River width is represented by entire cells. Forests and cities use symbolic models. Elevations come from Copernicus surface data; land cover is the 2021 snapshot.");
+                ui.label("Rivers retain logical cell identity; visible channels follow GIS paths with symbolic width. Urban cells use building clusters. Elevations come from Copernicus surface data; land cover is the 2021 snapshot.");
                 if let Some(document) = &view.document {
                     for source in &document.sources { ui.separator(); ui.strong(format!("{} · {}", source.name, source.version)); ui.label(&source.attribution); ui.hyperlink_to("Source data", &source.url); ui.hyperlink_to("License & terms", &source.license); ui.small(format!("Acquired Unix time: {} · SHA-256: {}", source.acquired_unix, source.sha256)); }
                 }
@@ -147,6 +172,7 @@ pub fn show(
             });
         });
     }
+    state.height_edit_finished = !ctx.input(|i| i.pointer.any_down());
     state.pointer_blocked = pointer_blocked(ctx, viewport_ui.available_rect_before_wrap());
     state.keyboard_blocked = ctx.egui_wants_keyboard_input();
     Ok(())
@@ -182,6 +208,12 @@ fn inspector(ui: &mut egui::Ui, cell: &Cell) {
     ));
     if !cell.river_ids.is_empty() {
         ui.small(format!("{} source river reaches", cell.river_ids.len()));
+    }
+    if let Some(urban) = &cell.urban {
+        ui.label(format!(
+            "Urban cell · {:?} · population {}",
+            urban.style, urban.population
+        ));
     }
     for city in &cell.cities {
         ui.label(format!("{} · population {}", city.name, city.population));

@@ -1,51 +1,84 @@
-//! Continuous source DEM surface clipped into hex-owned chunks. The hex lattice
-//! controls topology and selection, while a separate height field controls shape.
-use crate::{jobs::JobContext, map_core::*};
-use anyhow::{Result, ensure};
-use std::collections::{BTreeMap, HashMap};
-
+//! Continuous DEM surface with local river refinement and hex-owned triangles.
+use crate::{
+    hydrology::{Hydrology, WaterVertex, clip_polygon},
+    jobs::JobContext,
+    map_core::*,
+};
+use anyhow::Result;
+use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub const SUBDIVISIONS: i32 = 4;
-type VertexKey = (i32, i32);
-
+/// Millimeter local coordinates allow arbitrary source river/bank vertices.
+pub type VertexKey = (i64, i64);
 #[derive(Debug, Clone, Copy)]
 pub struct Corner {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub weights: [f32; 4],
+    pub raw_height: f64,
+    pub raw_gradient: [f32; 2],
 }
-
 #[derive(Debug)]
 pub struct ChunkGeometry {
     pub id: (i32, i32),
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
+    /// Linear RGB and urban coverage (land), or water color and opacity (water).
     pub weights: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
     pub triangle_cells: Vec<u32>,
     pub boundaries: BTreeMap<VertexKey, Corner>,
 }
-
+impl ChunkGeometry {
+    fn new(id: (i32, i32)) -> Self {
+        Self {
+            id,
+            positions: vec![],
+            normals: vec![],
+            weights: vec![],
+            indices: vec![],
+            triangle_cells: vec![],
+            boundaries: BTreeMap::new(),
+        }
+    }
+}
 pub struct TerrainGeometry {
     pub chunks: Vec<ChunkGeometry>,
-    /// All lattice samples, including subdivided hex edges and interiors.
+    pub water_chunks: Vec<ChunkGeometry>,
     pub corners: BTreeMap<VertexKey, Corner>,
-    pub exaggeration: f32,
+    pub triangles: Vec<Vec<[VertexKey; 3]>>,
+    pub heights: HeightSettings,
+    pub hydrology: Hydrology,
 }
-
-pub fn cell_triangles(hex: hexx::Hex) -> Vec<[VertexKey; 3]> {
+pub fn vertex_key(point: [f64; 2]) -> VertexKey {
+    (
+        (point[0] * 1000.).round() as i64,
+        (point[1] * 1000.).round() as i64,
+    )
+}
+pub fn vertex_point(key: VertexKey, _spacing: f64) -> [f64; 2] {
+    [key.0 as f64 / 1000., key.1 as f64 / 1000.]
+}
+pub fn outer_key(hex: hexx::Hex, corner: usize, spacing: f64) -> VertexKey {
+    vertex_key(vertex_position(corner_key(hex, corner), spacing))
+}
+pub fn cell_triangles(hex: hexx::Hex, spacing: f64) -> Vec<[VertexKey; 3]> {
     let center = (2 * hex.x + hex.y, 3 * hex.y);
-    let mut triangles = Vec::with_capacity((6 * SUBDIVISIONS * SUBDIVISIONS) as usize);
+    let mut triangles = Vec::new();
     for sector in 0..6 {
         let a = CORNER_OFFSETS[sector];
         let b = CORNER_OFFSETS[(sector + 1) % 6];
         let key = |i, j| {
-            (
-                center.0 * SUBDIVISIONS + a.0 * i + b.0 * j,
-                center.1 * SUBDIVISIONS + a.1 * i + b.1 * j,
-            )
+            vertex_key(vertex_position(
+                (
+                    center.0 * SUBDIVISIONS + a.0 * i + b.0 * j,
+                    center.1 * SUBDIVISIONS + a.1 * i + b.1 * j,
+                ),
+                spacing / f64::from(SUBDIVISIONS),
+            ))
         };
         for i in 0..SUBDIVISIONS {
-            for j in 0..(SUBDIVISIONS - i) {
+            for j in 0..SUBDIVISIONS - i {
                 triangles.push([key(i, j), key(i + 1, j), key(i, j + 1)]);
                 if i + j + 1 < SUBDIVISIONS {
                     triangles.push([key(i + 1, j), key(i + 1, j + 1), key(i, j + 1)]);
@@ -55,167 +88,287 @@ pub fn cell_triangles(hex: hexx::Hex) -> Vec<[VertexKey; 3]> {
     }
     triangles
 }
-
-pub fn vertex_point(key: VertexKey, spacing: f64) -> [f64; 2] {
-    vertex_position(key, spacing / f64::from(SUBDIVISIONS))
-}
-
-pub fn outer_key(hex: hexx::Hex, corner: usize) -> VertexKey {
-    let key = corner_key(hex, corner);
-    (key.0 * SUBDIVISIONS, key.1 * SUBDIVISIONS)
-}
-
-pub fn world_position(point_m: [f64; 2], height_m: f64, exaggeration: f32) -> [f32; 3] {
+pub fn world_position(point: [f64; 2], height: f64, settings: HeightSettings) -> [f32; 3] {
     [
-        (point_m[0] / 1000.) as f32,
-        (height_m / 1000.) as f32 * exaggeration,
-        (-point_m[1] / 1000.) as f32,
+        (point[0] / 1000.) as f32,
+        (settings.meters(height) / 1000.) as f32,
+        (-point[1] / 1000.) as f32,
     ]
 }
-
-pub fn cell_weights(cell: &Cell) -> [f32; 4] {
-    if cell.surface != Surface::Land {
-        return [0., 0., 0., 1.];
-    }
-    match cell.landscape {
-        Landscape::Plains => [1., 0., 0., 0.],
-        Landscape::Forest => [0., 1., 0., 0.],
-        Landscape::Mountain => [0., 0., 1., 0.],
-    }
-}
-
-// Smooth, compact weights influence future editable elevation offsets and land
-// materials. The source DEM is sampled directly, never replaced by cell means.
-fn neighborhood(document: &MapDocument, point: [f64; 2]) -> ([f32; 4], f64) {
+fn neighborhood(document: &MapDocument, point: [f64; 2]) -> (f64, f64) {
     let spacing = document.settings.spacing_km * 1000.;
     let hex = point_hex(point, spacing);
-    let mut weights = [0.; 4];
-    let mut delta = 0.;
-    let mut total = 0.;
+    let (mut delta, mut urban, mut total) = (0., 0., 0.);
     for dq in -2..=2 {
         for dr in -2..=2 {
-            if let Some(cell) = document.cell(hex + hexx::Hex::new(dq, dr)) {
-                let d = ((cell.center_m[0] - point[0]).powi(2)
-                    + (cell.center_m[1] - point[1]).powi(2))
-                .sqrt()
-                    / (spacing * 1.5);
+            if let Some(c) = document.cell(hex + hexx::Hex::new(dq, dr)) {
+                let d =
+                    (c.center_m[0] - point[0]).hypot(c.center_m[1] - point[1]) / (spacing * 1.1);
                 if d >= 1. {
                     continue;
                 }
-                let weight = (1. - d).powi(4) * (4. * d + 1.);
-                let mut land_weights = cell_weights(cell);
-                // Water is an explicit owning-cell surface; land blending stays
-                // independent so rivers cannot spread into unrelated neighbors.
-                if cell.surface != Surface::Land {
-                    land_weights = match cell.landscape {
-                        Landscape::Plains => [1., 0., 0., 0.],
-                        Landscape::Forest => [0., 1., 0., 0.],
-                        Landscape::Mountain => [0., 0., 1., 0.],
-                    };
+                let w = (1. - d).powi(4) * (4. * d + 1.);
+                total += w;
+                delta += (c.elevation_m - c.generated_elevation_m) * w;
+                if c.urban.is_some() {
+                    urban += w;
                 }
-                for (sum, value) in weights.iter_mut().zip(land_weights) {
-                    *sum += value * weight as f32;
-                }
-                delta += (cell.elevation_m - cell.generated_elevation_m) * weight;
-                total += weight;
             }
         }
     }
     if total > 0. {
-        weights = weights.map(|w| w / total as f32);
-        delta /= total;
+        (delta / total, urban / total)
     } else {
-        weights = [1., 0., 0., 0.];
+        (0., 0.)
     }
-    if let Some(cell) = document.cell(hex) {
-        if cell.surface != Surface::Land {
-            weights = [0., 0., 0., 1.];
-        }
-    } else {
-        // Exact exterior boundary samples retain water from adjacent source cells.
-        let water = hex
-            .all_neighbors()
-            .into_iter()
-            .filter_map(|h| document.cell(h))
-            .filter(|c| c.surface != Surface::Land)
-            .count();
-        if water > 0 {
-            weights = [0., 0., 0., 1.];
-        }
-    }
-    (weights, delta)
 }
-
-pub fn terrain_height(document: &MapDocument, point: [f64; 2]) -> Result<f64> {
-    let base = document
+pub fn edit_delta(document: &MapDocument, p: [f64; 2]) -> f64 {
+    neighborhood(document, p).0
+}
+pub fn source_height(document: &MapDocument, p: [f64; 2]) -> Result<f64> {
+    Ok(document
         .height_field
-        .sample(point)
-        .ok_or_else(|| anyhow::anyhow!("Source DEM does not cover terrain vertex"))?;
-    Ok(base + neighborhood(document, point).1)
+        .sample(p)
+        .ok_or_else(|| anyhow::anyhow!("Source DEM does not cover terrain vertex"))?
+        + edit_delta(document, p))
 }
-
+pub fn terrain_height(document: &MapDocument, hydrology: &Hydrology, p: [f64; 2]) -> Result<f64> {
+    Ok(hydrology.ground(document, p, source_height(document, p)?))
+}
+fn palette(document: &MapDocument, p: [f64; 2], slope: f64) -> [f32; 4] {
+    let cover = document.height_field.cover_weights(p);
+    // Tree, shrub, grass, crop, built, bare, snow, water bed, wetland, mangrove, moss.
+    let colors: [[f64; 3]; 11] = [
+        [0.105, 0.20, 0.07],
+        [0.25, 0.28, 0.105],
+        [0.29, 0.37, 0.13],
+        [0.36, 0.39, 0.16],
+        [0.31, 0.28, 0.23],
+        [0.34, 0.29, 0.22],
+        [0.70, 0.74, 0.73],
+        [0.23, 0.25, 0.16],
+        [0.15, 0.27, 0.13],
+        [0.09, 0.19, 0.10],
+        [0.27, 0.30, 0.17],
+    ];
+    let mut rgb = [0.; 3];
+    for (w, color) in cover.iter().zip(colors) {
+        for k in 0..3 {
+            rgb[k] += w * color[k];
+        }
+    }
+    // Actual uncompressed DEM slope exposes rock. Altitude alone never adds snow.
+    let rock = ((slope - 0.30) / 0.65).clamp(0., 0.85) * (1. - cover[6]);
+    let warmth = (0.5 + 0.5 * (p[0] / 1300. + p[1] / 2100.).sin()) * 0.05;
+    for k in 0..3 {
+        rgb[k] = rgb[k] * (1. - rock) + [0.32 + warmth, 0.30 + warmth * 0.6, 0.265][k] * rock;
+    }
+    let urban = neighborhood(document, p).1;
+    // Broad coverage reads as a complete urban cell, with a soft outer blend.
+    let urban = (urban * 1.5).clamp(0., 1.);
+    for k in 0..3 {
+        rgb[k] = rgb[k] * (1. - urban) + [0.29, 0.265, 0.225][k] * urban;
+    }
+    [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32, urban as f32]
+}
+fn normal(v: [f32; 3]) -> [f32; 3] {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    v.map(|x| x / n)
+}
+fn hex_outline(hex: hexx::Hex, spacing: f64) -> [[f64; 2]; 6] {
+    (0..6)
+        .map(|i| vertex_point(outer_key(hex, i, spacing), spacing))
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
+}
+fn assign_polygon(
+    document: &MapDocument,
+    polygon: &[WaterVertex],
+    assigned: &mut HashMap<u32, Vec<Vec<WaterVertex>>>,
+) {
+    let spacing = document.settings.spacing_km * 1000.;
+    let min_x = polygon
+        .iter()
+        .map(|v| v.point[0])
+        .fold(f64::INFINITY, f64::min);
+    let max_x = polygon
+        .iter()
+        .map(|v| v.point[0])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = polygon
+        .iter()
+        .map(|v| v.point[1])
+        .fold(f64::INFINITY, f64::min);
+    let max_y = polygon
+        .iter()
+        .map(|v| v.point[1])
+        .fold(f64::NEG_INFINITY, f64::max);
+    let row = spacing * 3_f64.sqrt() / 2.;
+    for r in (min_y / row).floor() as i32 - 1..=(max_y / row).ceil() as i32 + 1 {
+        for q in (min_x / spacing - r as f64 / 2.).floor() as i32 - 1
+            ..=(max_x / spacing - r as f64 / 2.).ceil() as i32 + 1
+        {
+            if let Some(cell) = document.cell(hexx::Hex::new(q, r)) {
+                let clipped = clip_polygon(polygon, &hex_outline(cell.hex, spacing));
+                if clipped.len() >= 3 {
+                    assigned.entry(cell.id).or_default().push(clipped);
+                }
+            }
+        }
+    }
+}
 pub fn build(
     document: &MapDocument,
-    exaggeration: f32,
+    heights: HeightSettings,
     context: &JobContext,
 ) -> Result<TerrainGeometry> {
-    ensure!(
-        exaggeration.is_finite() && (1. ..=12.).contains(&exaggeration),
-        "Invalid vertical exaggeration"
-    );
-    context.check()?;
+    heights.validate()?;
+    context.report(0.94, "Conditioning valley channels and shorelines")?;
+    let hydrology = Hydrology::build(document, context)?;
     let spacing = document.settings.spacing_km * 1000.;
+    let mut waters = HashMap::new();
+    let mut banks = HashMap::new();
+    for (i, p) in hydrology.polygons.iter().enumerate() {
+        if i % 512 == 0 {
+            context.check()?;
+        }
+        assign_polygon(document, &p.vertices, &mut waters);
+    }
+    for c in &hydrology.channels {
+        let length = (c.b[0] - c.a[0]).hypot(c.b[1] - c.a[1]);
+        let n = [-(c.b[1] - c.a[1]) / length, (c.b[0] - c.a[0]) / length];
+        for width in [
+            0.,
+            c.half_width * 0.5,
+            c.half_width + c.bank_width * 0.5,
+            c.half_width + c.bank_width,
+        ] {
+            // Thin ribbons also insert centerline and intermediate bed samples.
+            let w = width.max(c.half_width * 0.05);
+            let p = [(c.a, -1.), (c.b, -1.), (c.b, 1.), (c.a, 1.)].map(|(p, side)| WaterVertex {
+                point: [p[0] + n[0] * w * side, p[1] + n[1] * w * side],
+                level: 0.,
+                edge: 0.,
+            });
+            assign_polygon(document, &p, &mut banks);
+        }
+    }
     let mut corners = BTreeMap::new();
     let mut chunks = Vec::new();
+    let mut water_chunks = Vec::new();
+    let mut all_triangles = vec![vec![]; document.cells.len()];
     let groups = document.chunk_ids();
     let total = groups.len();
-    for (i, (id, cell_ids)) in groups.into_iter().enumerate() {
+    for (i, (id, ids)) in groups.into_iter().enumerate() {
         context.report(
             0.95 + 0.04 * i as f32 / total as f32,
             format!("Building terrain chunk {}/{}", i + 1, total),
         )?;
-        let mut chunk = ChunkGeometry {
-            id,
-            positions: vec![],
-            normals: vec![],
-            weights: vec![],
-            indices: vec![],
-            triangle_cells: vec![],
-            boundaries: BTreeMap::new(),
-        };
-        let mut local_vertices = HashMap::new();
-        for (n, cell_id) in cell_ids.into_iter().enumerate() {
-            if n % 128 == 0 {
+        let mut chunk = ChunkGeometry::new(id);
+        let mut water = ChunkGeometry::new(id);
+        let mut local = HashMap::new();
+        for (n, cell_id) in ids.into_iter().enumerate() {
+            if n % 64 == 0 {
                 context.check()?;
             }
             let cell = &document.cells[cell_id];
-            for triangle in cell_triangles(cell.hex) {
-                for key in triangle {
-                    let index = if let Some(index) = local_vertices.get(&key) {
+            let base = cell_triangles(cell.hex, spacing);
+            let water_polygons = waters.get(&cell.id);
+            let bank_polygons = banks.get(&cell.id);
+            let triangles = if water_polygons.is_none() && bank_polygons.is_none() {
+                base
+            } else {
+                let mut points: BTreeSet<_> = base.iter().flatten().copied().collect();
+                for poly in water_polygons
+                    .into_iter()
+                    .flatten()
+                    .chain(bank_polygons.into_iter().flatten())
+                {
+                    points.extend(poly.iter().map(|v| vertex_key(v.point)));
+                }
+                let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
+                let mut handles = HashMap::new();
+                for key in points {
+                    let p = vertex_point(key, spacing);
+                    handles.insert(key, cdt.insert(Point2::new(p[0], p[1]))?);
+                }
+                let outline = hex_outline(cell.hex, spacing);
+                for j in 0..6 {
+                    let a = handles[&vertex_key(outline[j])];
+                    let b = handles[&vertex_key(outline[(j + 1) % 6])];
+                    cdt.add_constraint(a, b);
+                }
+                // Boundary constraints and water outlines keep triangles from
+                // bridging narrow channels. Intersecting junction outlines use
+                // the already-inserted vertices instead of crossing constraints.
+                for poly in water_polygons
+                    .into_iter()
+                    .flatten()
+                    .chain(bank_polygons.into_iter().flatten())
+                {
+                    for j in 0..poly.len() {
+                        let a = handles[&vertex_key(poly[j].point)];
+                        let b = handles[&vertex_key(poly[(j + 1) % poly.len()].point)];
+                        if a != b && cdt.can_add_constraint(a, b) {
+                            cdt.add_constraint(a, b);
+                        }
+                    }
+                }
+                cdt.inner_faces()
+                    .filter_map(|f| {
+                        let p = f.vertices().map(|v| [v.position().x, v.position().y]);
+                        let centroid = [
+                            (p[0][0] + p[1][0] + p[2][0]) / 3.,
+                            (p[0][1] + p[1][1] + p[2][1]) / 3.,
+                        ];
+                        (point_hex(centroid, spacing) == cell.hex).then(|| p.map(vertex_key))
+                    })
+                    .collect()
+            };
+            for keys in &triangles {
+                for &key in keys {
+                    let index = if let Some(index) = local.get(&key) {
                         *index
                     } else {
-                        let vertex = if let Some(vertex) = corners.get(&key) {
-                            *vertex
+                        let vertex = if let Some(v) = corners.get(&key) {
+                            *v
                         } else {
-                            let point = vertex_point(key, spacing);
-                            let (weights, delta) = neighborhood(document, point);
-                            let height = document.height_field.sample(point).ok_or_else(|| {
-                                anyhow::anyhow!("Source DEM does not cover terrain vertex")
-                            })? + delta;
-                            let epsilon = document.height_field.step_m * 0.35;
-                            let east = terrain_height(document, [point[0] + epsilon, point[1]])?;
-                            let west = terrain_height(document, [point[0] - epsilon, point[1]])?;
-                            let north = terrain_height(document, [point[0], point[1] + epsilon])?;
-                            let south = terrain_height(document, [point[0], point[1] - epsilon])?;
-                            let normal = normalized([
-                                (-(east - west) / (2. * epsilon)) as f32 * exaggeration,
-                                1.,
-                                ((north - south) / (2. * epsilon)) as f32 * exaggeration,
-                            ]);
+                            let p = vertex_point(key, spacing);
+                            let h = terrain_height(document, &hydrology, p)?;
+                            let epsilon = (document.height_field.step_m * 0.08).max(1.);
+                            let east =
+                                terrain_height(document, &hydrology, [p[0] + epsilon, p[1]])?;
+                            let west =
+                                terrain_height(document, &hydrology, [p[0] - epsilon, p[1]])?;
+                            let north =
+                                terrain_height(document, &hydrology, [p[0], p[1] + epsilon])?;
+                            let south =
+                                terrain_height(document, &hydrology, [p[0], p[1] - epsilon])?;
+                            let source_east = source_height(document, [p[0] + epsilon, p[1]])?;
+                            let source_west = source_height(document, [p[0] - epsilon, p[1]])?;
+                            let source_north = source_height(document, [p[0], p[1] + epsilon])?;
+                            let source_south = source_height(document, [p[0], p[1] - epsilon])?;
+                            let slope = (source_east - source_west)
+                                .hypot(source_north - source_south)
+                                / (2. * epsilon);
                             let vertex = Corner {
-                                position: world_position(point, height, exaggeration),
-                                normal,
-                                weights,
+                                position: world_position(p, h, heights),
+                                normal: normal([
+                                    (-(heights.meters(east) - heights.meters(west))
+                                        / (2. * epsilon))
+                                        as f32,
+                                    1.,
+                                    ((heights.meters(north) - heights.meters(south))
+                                        / (2. * epsilon))
+                                        as f32,
+                                ]),
+                                weights: palette(document, p, slope),
+                                raw_height: h,
+                                raw_gradient: [
+                                    ((east - west) / (2. * epsilon)) as f32,
+                                    ((north - south) / (2. * epsilon)) as f32,
+                                ],
                             };
                             corners.insert(key, vertex);
                             vertex
@@ -225,54 +378,90 @@ pub fn build(
                         chunk.normals.push(vertex.normal);
                         chunk.weights.push(vertex.weights);
                         chunk.boundaries.insert(key, vertex);
-                        local_vertices.insert(key, index);
+                        local.insert(key, index);
                         index
                     };
                     chunk.indices.push(index);
                 }
                 chunk.triangle_cells.push(cell.id);
             }
+            all_triangles[cell_id] = triangles;
+            for poly in water_polygons.into_iter().flatten() {
+                for j in 1..poly.len() - 1 {
+                    let verts = [poly[0], poly[j], poly[j + 1]];
+                    let area = (verts[1].point[0] - verts[0].point[0])
+                        * (verts[2].point[1] - verts[0].point[1])
+                        - (verts[1].point[1] - verts[0].point[1])
+                            * (verts[2].point[0] - verts[0].point[0]);
+                    if area.abs() < 0.01 {
+                        continue;
+                    }
+                    let verts = if area < 0. {
+                        [verts[0], verts[2], verts[1]]
+                    } else {
+                        verts
+                    };
+                    let p = verts.map(|v| world_position(v.point, v.level + 0.5, heights));
+                    let a = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
+                    let b = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
+                    let n = normal([
+                        a[1] * b[2] - a[2] * b[1],
+                        a[2] * b[0] - a[0] * b[2],
+                        a[0] * b[1] - a[1] * b[0],
+                    ]);
+                    for (v, position) in verts.into_iter().zip(p) {
+                        water.indices.push(water.positions.len() as u32);
+                        water.positions.push(position);
+                        water.normals.push(n);
+                        water.weights.push([
+                            0.025 + 0.018 * v.edge as f32,
+                            0.17 + 0.025 * v.edge as f32,
+                            0.20,
+                            1.,
+                        ]);
+                    }
+                    water.triangle_cells.push(cell.id);
+                }
+            }
         }
         chunks.push(chunk);
+        if !water.indices.is_empty() {
+            water_chunks.push(water);
+        }
     }
     context.check()?;
     Ok(TerrainGeometry {
         chunks,
+        water_chunks,
         corners,
-        exaggeration,
+        triangles: all_triangles,
+        heights,
+        hydrology,
     })
 }
-
 pub fn height_at(
     cell: &Cell,
-    point: [f64; 2],
-    spacing: f64,
+    p: [f64; 2],
+    _spacing: f64,
     geometry: &TerrainGeometry,
 ) -> Option<f32> {
-    surface_height(
-        cell,
-        point,
-        spacing,
-        geometry.exaggeration,
-        &geometry.corners,
-    )
+    surface_height(cell, p, &geometry.triangles, &geometry.corners)
 }
-
 pub fn surface_height(
     cell: &Cell,
-    point_m: [f64; 2],
-    _spacing: f64,
-    _: f32,
+    p: [f64; 2],
+    triangles: &[Vec<[VertexKey; 3]>],
     corners: &BTreeMap<VertexKey, Corner>,
 ) -> Option<f32> {
-    let point = [(point_m[0] / 1000.) as f32, (-point_m[1] / 1000.) as f32];
-    for keys in cell_triangles(cell.hex) {
-        let [a, b, c] = keys.map(|key| corners[&key].position);
-        let determinant = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);
-        let wa =
-            ((b[2] - c[2]) * (point[0] - c[0]) + (c[0] - b[0]) * (point[1] - c[2])) / determinant;
-        let wb =
-            ((c[2] - a[2]) * (point[0] - c[0]) + (a[0] - c[0]) * (point[1] - c[2])) / determinant;
+    let p = [(p[0] / 1000.) as f32, (-p[1] / 1000.) as f32];
+    for keys in &triangles[cell.id as usize] {
+        let [a, b, c] = keys.map(|k| corners[&k].position);
+        let d = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);
+        if d.abs() < 1e-12 {
+            continue;
+        }
+        let wa = ((b[2] - c[2]) * (p[0] - c[0]) + (c[0] - b[0]) * (p[1] - c[2])) / d;
+        let wb = ((c[2] - a[2]) * (p[0] - c[0]) + (a[0] - c[0]) * (p[1] - c[2])) / d;
         let wc = 1. - wa - wb;
         if wa >= -1e-5 && wb >= -1e-5 && wc >= -1e-5 {
             return Some(wa * a[1] + wb * b[1] + wc * c[1]);
@@ -280,12 +469,6 @@ pub fn surface_height(
     }
     None
 }
-
-fn normalized(v: [f32; 3]) -> [f32; 3] {
-    let length = v.iter().map(|n| n * n).sum::<f32>().sqrt();
-    v.map(|n| n / length)
-}
-
 #[cfg(test)]
 pub(crate) fn fixture() -> Result<MapDocument> {
     let settings = GenerationSettings::default();
@@ -298,8 +481,7 @@ pub(crate) fn fixture() -> Result<MapDocument> {
     let step = 500.;
     let width = 190;
     let height = 210;
-    let origin_m = [-47_000., -52_000.];
-    // A diagonal ridge with a valley, used only to test terrain geometry.
+    let origin_m = [-47000., -52000.];
     let elevations_m = (0..height)
         .flat_map(|y| {
             (0..width).map(move |x| {
@@ -310,8 +492,8 @@ pub(crate) fn fixture() -> Result<MapDocument> {
             })
         })
         .collect();
-    let mut document = MapDocument {
-        schema_version: 1,
+    let mut d = MapDocument {
+        schema_version: 2,
         generator_version: "geometry-test".into(),
         settings,
         projection_wkt: projection.wkt,
@@ -319,109 +501,117 @@ pub(crate) fn fixture() -> Result<MapDocument> {
         cells,
         sources: vec![],
         river_network: vec![],
+        river_paths: vec![],
+        heights: HeightSettings::default(),
         height_field: HeightField {
             origin_m,
             step_m: step,
             width,
             height,
             elevations_m,
+            land_cover: vec![30; width * height],
         },
         index: Default::default(),
     };
-    document.rebuild_index()?;
-    Ok(document)
+    d.rebuild_index()?;
+    Ok(d)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn check_seams(geometry: &TerrainGeometry) -> usize {
+    fn seams(g: &TerrainGeometry) -> usize {
         let mut shared = BTreeMap::<VertexKey, Corner>::new();
-        let mut matches = 0;
-        for chunk in &geometry.chunks {
-            for (key, vertex) in &chunk.boundaries {
-                if let Some(previous) = shared.insert(*key, *vertex) {
-                    assert_eq!(previous.position, vertex.position);
-                    assert_eq!(previous.normal, vertex.normal);
-                    matches += 1;
+        let mut n = 0;
+        for c in &g.chunks {
+            for (k, v) in &c.boundaries {
+                if let Some(prev) = shared.insert(*k, *v) {
+                    assert_eq!(prev.position, v.position);
+                    assert_eq!(prev.normal, v.normal);
+                    n += 1;
                 }
             }
         }
-        matches
+        n
     }
-
     #[test]
-    fn source_ridge_crosses_hexes_without_flat_interiors() -> Result<()> {
-        let document = fixture()?;
-        let geometry = build(&document, 3., &JobContext::default())?;
-        assert!(check_seams(&geometry) > 100);
-        let mut sloped_cells = 0;
-        for cell in &document.cells {
-            let center = (2 * cell.hex.x + cell.hex.y, 3 * cell.hex.y);
-            let key = (center.0 * SUBDIVISIONS, center.1 * SUBDIVISIONS);
-            let near = (key.0 + 1, key.1 + 1);
-            let a = geometry.corners[&key].position[1];
-            let b = geometry.corners[&near].position[1];
-            if (a - b).abs() > 0.002 {
-                sloped_cells += 1;
-            }
-            let expected = document
-                .height_field
-                .sample(vertex_point(key, 2000.))
-                .unwrap() as f32
-                * 0.003;
-            assert!((a - expected).abs() < 1e-5);
+    fn continuous_ridges_compress_monotonically_without_changing_dem() -> Result<()> {
+        let d = fixture()?;
+        let original = d.height_field.elevations_m.clone();
+        let g = build(&d, d.heights, &JobContext::default())?;
+        assert!(seams(&g) > 100);
+        for h in [-100., 0., 100., 500., 1000., 4000.] {
+            assert!(d.heights.meters(h + 1.) > d.heights.meters(h));
         }
-        assert!(sloped_cells > document.cells.len() / 2);
+        assert!(d.heights.meters(4000.) < 1200.);
+        assert_eq!(original, d.height_field.elevations_m);
+        for c in &d.cells {
+            let k = vertex_key(c.center_m);
+            let expected = d.heights.meters(source_height(&d, c.center_m)?) / 1000.;
+            assert!((f64::from(g.corners[&k].position[1]) - expected).abs() < 1e-5);
+        }
         Ok(())
     }
-
     #[test]
-    fn chunk_seams_match_after_boundary_elevation_change() -> Result<()> {
-        let mut document = fixture()?;
-        let before = build(&document, 3., &JobContext::default())?;
-        let index = document.index[&hexx::Hex::ZERO];
-        document.cells[index].elevation_m += 1700.;
-        let after = build(&document, 3., &JobContext::default())?;
-        assert!(check_seams(&after) > 100);
-        let key = outer_key(hexx::Hex::ZERO, 0);
-        assert_ne!(before.corners[&key].position, after.corners[&key].position);
-        Ok(())
-    }
-
-    #[test]
-    fn triangles_retain_hex_ownership_and_river_interiors() -> Result<()> {
-        let mut document = fixture()?;
-        let cell = &mut document.cells[0];
-        cell.surface = Surface::River;
-        let hex = cell.hex;
-        let geometry = build(&document, 3., &JobContext::default())?;
-        let key = ((2 * hex.x + hex.y) * SUBDIVISIONS, 3 * hex.y * SUBDIVISIONS);
-        assert_eq!(geometry.corners[&key].weights, [0., 0., 0., 1.]);
-        for chunk in &geometry.chunks {
-            for (triangle, id) in chunk
-                .indices
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .zip(&chunk.triangle_cells)
-            {
+    fn rivers_are_separate_gentle_water_and_carved_beds_with_hex_picking() -> Result<()> {
+        let mut d = fixture()?;
+        d.river_paths.push(RiverPath {
+            id: 1,
+            next_down: 0,
+            discharge: 50.,
+            stream_order: 4,
+            points_m: vec![[-5000., 15000.], [0., 0.], [5000., -15000.]],
+        });
+        let g = build(&d, d.heights, &JobContext::default())?;
+        assert!(seams(&g) > 100);
+        assert!(!g.water_chunks.is_empty());
+        for c in &g.hydrology.channels {
+            let length = (c.b[0] - c.a[0]).hypot(c.b[1] - c.a[1]);
+            assert!(c.levels[0] >= c.levels[1] - 1e-6);
+            assert!((c.levels[0] - c.levels[1]) / length <= 0.030001);
+            let p = [(c.a[0] + c.b[0]) / 2., (c.a[1] + c.b[1]) / 2.];
+            assert!(terrain_height(&d, &g.hydrology, p)? < g.hydrology.water_level(&d, p).unwrap());
+        }
+        for c in &g.water_chunks {
+            assert!(c.normals.iter().all(|n| n[1] > 0.99));
+            for (t, id) in c.indices.as_chunks::<3>().0.iter().zip(&c.triangle_cells) {
                 let p = [
-                    triangle
-                        .iter()
-                        .map(|v| f64::from(chunk.positions[*v as usize][0]) * 1000.)
+                    t.iter()
+                        .map(|v| f64::from(c.positions[*v as usize][0]) * 1000.)
                         .sum::<f64>()
                         / 3.,
-                    triangle
-                        .iter()
-                        .map(|v| -f64::from(chunk.positions[*v as usize][2]) * 1000.)
+                    t.iter()
+                        .map(|v| -f64::from(c.positions[*v as usize][2]) * 1000.)
                         .sum::<f64>()
                         / 3.,
                 ];
-                assert_eq!(point_hex(p, 2000.), document.cells[*id as usize].hex);
-                assert!(height_at(&document.cells[*id as usize], p, 2000., &geometry).is_some());
+                assert_eq!(point_hex(p, 2000.), d.cells[*id as usize].hex);
             }
         }
+        let i = d.index[&hexx::Hex::ZERO];
+        d.cells[i].elevation_m += 500.;
+        let after = build(&d, d.heights, &JobContext::default())?;
+        assert!(seams(&after) > 100);
+        assert_ne!(
+            g.corners[&outer_key(hexx::Hex::ZERO, 0, 2000.)].position,
+            after.corners[&outer_key(hexx::Hex::ZERO, 0, 2000.)].position
+        );
+        Ok(())
+    }
+    #[test]
+    fn snow_requires_source_snow_and_urban_ground_spans_cell() -> Result<()> {
+        let mut d = fixture()?;
+        let p = [0., 0.];
+        let grass = palette(&d, p, 0.1);
+        d.height_field.land_cover.fill(70);
+        let snow = palette(&d, p, 0.1);
+        assert!(snow[0] > grass[0] + 0.3);
+        d.height_field.land_cover.fill(30);
+        let i = d.index[&hexx::Hex::ZERO];
+        d.cells[i].urban = Some(UrbanTerrain {
+            population: 100000,
+            style: UrbanStyle::Mixed,
+        });
+        assert!(palette(&d, [600., 0.], 0.1)[3] > 0.8);
         Ok(())
     }
 }
