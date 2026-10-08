@@ -19,6 +19,7 @@ pub struct Corner {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub weights: [f32; 4],
+    pub materials: [f32; 4],
     pub display: DisplayVertex,
 }
 #[derive(Debug)]
@@ -28,6 +29,8 @@ pub struct ChunkGeometry {
     pub normals: Vec<[f32; 3]>,
     /// Linear RGB and urban coverage (land), or water color and shallowness (water).
     pub weights: Vec<[f32; 4]>,
+    /// Grass, soil, gravel and rock weights from source cover and slope.
+    pub materials: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
     pub triangle_cells: Vec<u32>,
     pub boundaries: BTreeMap<VertexKey, Corner>,
@@ -40,6 +43,7 @@ impl ChunkGeometry {
             positions: vec![],
             normals: vec![],
             weights: vec![],
+            materials: vec![],
             indices: vec![],
             triangle_cells: vec![],
             boundaries: BTreeMap::new(),
@@ -218,6 +222,28 @@ fn palette(
         rgb[k] = rgb[k] * (1. - wet * 0.45) + [0.16, 0.13, 0.085][k] * wet * 0.25;
     }
     [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32, urban as f32]
+}
+fn material_weights(
+    document: &MapDocument,
+    p: [f64; 2],
+    slope: f64,
+    hydrology: &Hydrology,
+) -> [f32; 4] {
+    let c = document.height_field.cover_weights(p);
+    let rock = ((slope - 0.25) / 0.65).clamp(0., 0.9) * (1. - c[6] - c[4]).max(0.);
+    let wet = hydrology.bank_moisture(document, p);
+    let grass =
+        (c[0] * 0.5 + c[1] * 0.5 + c[2] + c[3] * 0.8 + c[8] * 0.5 + c[9] * 0.4 + c[10] * 0.5)
+            * (1. - rock)
+            * (1. - wet * 0.6);
+    let exposed = c[5] * (1. - rock);
+    let soil = ((1. - c[4] - c[6]) - grass - exposed - rock).max(0.);
+    [
+        grass as f32,
+        soil as f32,
+        (exposed * 0.65) as f32,
+        (rock + exposed * 0.35) as f32,
+    ]
 }
 fn hex_outline(hex: hexx::Hex, spacing: f64) -> [[f64; 2]; 6] {
     (0..6)
@@ -597,6 +623,7 @@ pub fn build(
                                 position,
                                 normal: display.normal(heights),
                                 weights: palette(document, p, slope, Some(&hydrology)),
+                                materials: material_weights(document, p, slope, &hydrology),
                                 display,
                             };
                             corners.insert(key, vertex);
@@ -606,6 +633,7 @@ pub fn build(
                         chunk.positions.push(vertex.position);
                         chunk.normals.push(vertex.normal);
                         chunk.weights.push(vertex.weights);
+                        chunk.materials.push(vertex.materials);
                         chunk.display.push(vertex.display);
                         chunk.boundaries.insert(key, vertex);
                         local.insert(key, index);
@@ -670,6 +698,7 @@ pub fn build(
                                 0.14 + 0.02 * edge as f32,
                                 edge as f32,
                             ],
+                            materials: [0.; 4],
                             display,
                         };
                         water_corners.insert(key, vertex);
@@ -693,6 +722,7 @@ pub fn build(
                     water.positions.push(v.position);
                     water.normals.push(v.normal);
                     water.weights.push(v.weights);
+                    water.materials.push(v.materials);
                     water.display.push(v.display);
                     water.boundaries.insert(key, v);
                 }

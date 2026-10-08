@@ -1,5 +1,6 @@
 //! Native generation UI and derived 3D view. Heavy GIS and mesh work runs on one
 //! cancellable worker; only complete, current revisions reach the live scene.
+mod art;
 mod camera;
 mod scene;
 mod ui;
@@ -21,6 +22,7 @@ use bevy::{
 };
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 use camera::OrbitCamera;
+use hexx::Hex;
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -33,6 +35,12 @@ pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainBlend>;
 pub struct TerrainBlend {
     #[uniform(100)]
     pub settings: Vec4,
+    #[texture(101, dimension = "2d_array")]
+    #[sampler(102)]
+    pub color: Handle<Image>,
+    #[texture(103, dimension = "2d_array")]
+    #[sampler(104)]
+    pub detail: Handle<Image>,
 }
 
 impl MaterialExtension for TerrainBlend {
@@ -140,9 +148,11 @@ struct PreparedMap {
     models: Vec<ModelPlacement>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelKind {
     Tree,
+    Conifer,
     Building,
     Rock,
     Shrub,
@@ -165,6 +175,8 @@ struct LaunchOptions {
     screenshot: Option<PathBuf>,
     smoke: bool,
     outlines: bool,
+    focus: Option<Hex>,
+    distance: Option<f32>,
     ready_frames: u32,
     capture_started: bool,
     picking_checked: bool,
@@ -182,6 +194,23 @@ pub fn run() -> Result<()> {
             }
             "--smoke" => options.smoke = true,
             "--outlines" => options.outlines = true,
+            "--focus" => {
+                options.focus = Some(Hex {
+                    x: args.next().context("Missing focus hex q")?.parse()?,
+                    y: args.next().context("Missing focus hex r")?.parse()?,
+                });
+            }
+            "--distance" => {
+                let distance: f32 = args
+                    .next()
+                    .context("Missing camera distance in km")?
+                    .parse()?;
+                anyhow::ensure!(
+                    distance.is_finite() && (0.5..=3000.).contains(&distance),
+                    "Camera distance must be 0.5–3000 km"
+                );
+                options.distance = Some(distance);
+            }
             "--screenshot" => {
                 options.screenshot = Some(PathBuf::from(
                     args.next().context("Missing screenshot path")?,
@@ -189,7 +218,7 @@ pub fn run() -> Result<()> {
             }
             "--help" => {
                 println!(
-                    "hex-cell-map [--preview GIS_PROBE_JSON] [--smoke --screenshot FILE.png] [--outlines]\nGenerate real GIS maps using the native window. Preview inputs are development validation artifacts, not portable user projects."
+                    "hex-cell-map [--preview GIS_PROBE_JSON] [--smoke --screenshot FILE.png] [--outlines] [--focus Q R --distance KM]\nGenerate real GIS maps using the native window. Preview inputs and smoke camera options are development validation tools, not portable user projects."
                 );
                 return Ok(());
             }
@@ -202,16 +231,28 @@ pub fn run() -> Result<()> {
             "Smoke validation requires --preview and --screenshot"
         );
     }
+    anyhow::ensure!(
+        options.smoke || (options.focus.is_none() && options.distance.is_none()),
+        "Focus and distance options require --smoke"
+    );
     let grid = options.outlines;
+    let asset_root = art::asset_root()?;
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "Hex Cell Map".into(),
-            resolution: (1440, 960).into(),
-            ..default()
-        }),
-        ..default()
-    }))
+    app.add_plugins(
+        DefaultPlugins
+            .set(AssetPlugin {
+                file_path: asset_root.to_string_lossy().into_owned(),
+                ..default()
+            })
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "Hex Cell Map".into(),
+                    resolution: (1440, 960).into(),
+                    ..default()
+                }),
+                ..default()
+            }),
+    )
     .add_plugins(EguiPlugin::default())
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .insert_resource(ClearColor(Color::srgb(0.075, 0.095, 0.12)))
@@ -224,10 +265,14 @@ pub fn run() -> Result<()> {
     .insert_resource(UiState { grid, ..default() })
     .init_resource::<Jobs>()
     .init_resource::<OrbitCamera>()
-    .add_systems(Startup, (scene::setup, ui::setup, launch_preview).chain())
+    .add_systems(
+        Startup,
+        (art::start, scene::setup, ui::setup, launch_preview).chain(),
+    )
     .add_systems(
         Update,
         (
+            art::poll,
             poll_jobs,
             scene::height_preview,
             start_jobs,
@@ -416,6 +461,7 @@ fn poll_jobs(
     mut meshes: ResMut<Assets<Mesh>>,
     mut gizmo_assets: ResMut<Assets<GizmoAsset>>,
     assets: Res<scene::SceneAssets>,
+    art: Res<art::ArtLibrary>,
 ) {
     let Some(job) = jobs.active.as_mut() else {
         return;
@@ -423,6 +469,16 @@ fn poll_jobs(
     for p in job.progress.lock().unwrap().try_iter() {
         job.fraction = job.fraction.max(p.fraction.min(0.99));
         ui.status = p.message;
+    }
+    if let Some(error) = &art.error {
+        job.context.cancel();
+        ui.error = Some(error.clone());
+        jobs.active = None;
+        return;
+    }
+    if !art.ready && job.context.check().is_ok() {
+        ui.status = "Loading landscape art".into();
+        return;
     }
     let result = job.result.lock().unwrap().try_recv();
     match result {
@@ -453,6 +509,7 @@ fn poll_jobs(
                         &mut meshes,
                         &mut gizmo_assets,
                         &assets,
+                        &art,
                         &prepared,
                     );
                     if refit {
@@ -513,12 +570,37 @@ fn prepare(
     let geometry = terrain::build(&document, heights, context)?;
     let spacing = document.settings.spacing_km * 1000.;
     let mut models = Vec::new();
+    // Imported meshes have more detail than the old primitives. Divide a fixed
+    // vegetation allowance across the complete region rather than filling it
+    // in cell order and leaving the far end undecorated.
+    let forest_demand: f64 = document
+        .cells
+        .iter()
+        .filter(|c| {
+            c.landscape == Landscape::Forest && c.surface == Surface::Land && c.urban.is_none()
+        })
+        .map(|c| c.forest_fraction * 18.)
+        .sum();
+    let density = (24_000. / forest_demand.max(1.)).min(1.);
+    let decoration_density = (12_000. / (document.cells.len().max(1) as f64 * 3.)).min(1.);
+    let urban_count = document
+        .cells
+        .iter()
+        .filter(|c| c.urban.is_some())
+        .count()
+        .max(1);
+    let city_limit = (12_000 / urban_count).clamp(1, 25);
     for (i, cell) in document.cells.iter().enumerate() {
         if i % 256 == 0 {
             context.check()?;
         }
-        if cell.urban.is_none() && cell.surface != Surface::Water && models.len() < 60_000 {
-            let count = (cell.forest_fraction * 14.).round() as u64;
+        if cell.landscape == Landscape::Forest
+            && cell.surface == Surface::Land
+            && cell.urban.is_none()
+            && models.len() < 60_000
+        {
+            let count =
+                placement_count(cell.forest_fraction * 18. * density, u64::from(cell.id), 17);
             for n in 0..count {
                 let seed = (u64::from(cell.id) * 7919 + n * 104729 + 17) % 65521;
                 let angle = seed as f64 * 0.61803398875 * std::f64::consts::TAU;
@@ -534,13 +616,25 @@ fn prepare(
                     continue;
                 }
                 if let Some(height) = terrain::height_at(cell, p, spacing, &geometry) {
+                    let temperate = document
+                        .settings
+                        .region
+                        .south
+                        .abs()
+                        .min(document.settings.region.north.abs())
+                        > 25.;
+                    let kind = if temperate && cell.generated_elevation_m > 1000. && seed % 3 != 0 {
+                        ModelKind::Conifer
+                    } else {
+                        ModelKind::Tree
+                    };
                     models.push(ModelPlacement {
-                        kind: ModelKind::Tree,
+                        kind,
                         position: Vec3::new((p[0] / 1000.) as f32, height, (-p[1] / 1000.) as f32),
                         scale: document.settings.spacing_km as f32
-                            * (0.075 + 0.035 * (seed % 10) as f32 / 10.),
+                            * (0.11 + 0.045 * (seed % 10) as f32 / 10.),
                         yaw: angle as f32,
-                        variant: seed as usize % 3,
+                        variant: seed as usize,
                         cell_id: cell.id,
                         point_m: p,
                     });
@@ -548,7 +642,8 @@ fn prepare(
             }
         }
         if cell.urban.is_none() && cell.surface != Surface::Water && models.len() < 60_000 {
-            for n in 0..2_u64 {
+            let count = placement_count(3. * decoration_density, u64::from(cell.id), 97);
+            for n in 0..count {
                 let seed = (u64::from(cell.id) * 3571 + n * 7919 + 97) % 65521;
                 let angle = seed as f64 * 0.61803398875 * std::f64::consts::TAU;
                 let radius = spacing * (0.15 + 0.2 * (seed % 100) as f64 / 100.);
@@ -573,9 +668,14 @@ fn prepare(
                     models.push(ModelPlacement {
                         kind,
                         position: Vec3::new((p[0] / 1000.) as f32, h, (-p[1] / 1000.) as f32),
-                        scale: document.settings.spacing_km as f32 * 0.05,
+                        scale: document.settings.spacing_km as f32
+                            * if matches!(kind, ModelKind::Rock) {
+                                0.095
+                            } else {
+                                0.06
+                            },
                         yaw: angle as f32,
-                        variant: seed as usize % 3,
+                        variant: seed as usize,
                         cell_id: cell.id,
                         point_m: p,
                     });
@@ -585,39 +685,45 @@ fn prepare(
         if let Some(urban) = &cell.urban {
             let importance = (urban.population.max(1000) as f64).log10();
             let size = match urban.style {
-                UrbanStyle::LowRise => 5,
-                UrbanStyle::Dense => 9,
-                UrbanStyle::Mixed => (importance.round() as i32 + 1).clamp(5, 9),
+                UrbanStyle::LowRise => 3,
+                UrbanStyle::Dense => 5,
+                UrbanStyle::Mixed => (importance.round() as i32 - 1).clamp(3, 5),
             };
-            for y in -size / 2..=size / 2 {
-                for x in -size / 2..=size / 2 {
-                    let p = [
-                        cell.center_m[0] + x as f64 * spacing * 0.09,
-                        cell.center_m[1] + y as f64 * spacing * 0.09,
-                    ];
-                    if point_hex(p, spacing) != cell.hex
-                        || geometry.hydrology.water_level(&document, p).is_some()
-                    {
-                        continue;
-                    }
-                    let Some(h) = terrain::height_at(cell, p, spacing, &geometry) else {
-                        continue;
-                    };
-                    let seed =
-                        (cell.id as i64 * 7919 + x as i64 * 61 + y as i64 * 127).unsigned_abs();
-                    let scale = document.settings.spacing_km as f32
-                        * (0.045 + (importance as f32 - 3.).max(0.) * 0.007)
-                        * (0.8 + (seed % 5) as f32 * 0.10);
-                    models.push(ModelPlacement {
-                        kind: ModelKind::Building,
-                        position: Vec3::new((p[0] / 1000.) as f32, h, (-p[1] / 1000.) as f32),
-                        scale,
-                        yaw: 0.,
-                        variant: seed as usize % 3,
-                        cell_id: cell.id,
-                        point_m: p,
-                    });
+            let mut offsets: Vec<_> = (-size / 2..=size / 2)
+                .flat_map(|y| (-size / 2..=size / 2).map(move |x| (x, y)))
+                .collect();
+            offsets.sort_by_key(|(x, y)| x * x + y * y);
+            let mut placed = 0;
+            for (x, y) in offsets {
+                if placed >= city_limit {
+                    break;
                 }
+                let p = [
+                    cell.center_m[0] + x as f64 * spacing * 0.16,
+                    cell.center_m[1] + y as f64 * spacing * 0.16,
+                ];
+                if point_hex(p, spacing) != cell.hex
+                    || geometry.hydrology.water_level(&document, p).is_some()
+                {
+                    continue;
+                }
+                let Some(h) = terrain::height_at(cell, p, spacing, &geometry) else {
+                    continue;
+                };
+                let seed = (cell.id as i64 * 7919 + x as i64 * 61 + y as i64 * 127).unsigned_abs();
+                let scale = document.settings.spacing_km as f32
+                    * (0.09 + (importance as f32 - 3.).max(0.) * 0.012)
+                    * (0.8 + (seed % 5) as f32 * 0.10);
+                placed += 1;
+                models.push(ModelPlacement {
+                    kind: ModelKind::Building,
+                    position: Vec3::new((p[0] / 1000.) as f32, h, (-p[1] / 1000.) as f32),
+                    scale,
+                    yaw: (seed % 4) as f32 * std::f32::consts::FRAC_PI_2,
+                    variant: seed as usize,
+                    cell_id: cell.id,
+                    point_m: p,
+                });
             }
         }
     }
@@ -629,9 +735,90 @@ fn prepare(
     })
 }
 
+fn placement_count(expected: f64, id: u64, salt: u64) -> u64 {
+    let seed = id.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(salt);
+    let fraction = (seed >> 11) as f64 / (1_u64 << 53) as f64;
+    expected.floor() as u64 + u64::from(fraction < expected.fract())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_model_placement_uses_gis_cover_dry_ground_and_urban_cells() -> Result<()> {
+        let mut document = crate::terrain::fixture()?;
+        document.height_field.land_cover.fill(10);
+        for cell in &mut document.cells {
+            cell.forest_fraction = 0.8;
+            cell.landscape = match cell.id % 3 {
+                0 => Landscape::Forest,
+                1 => Landscape::Plains,
+                _ => Landscape::Mountain,
+            };
+            if cell.id % 9 == 0 {
+                cell.surface = Surface::River;
+            } else if cell.id % 9 == 3 {
+                cell.surface = Surface::Water;
+            }
+        }
+        let city = document.index[&hexx::Hex::ZERO];
+        document.cells[city].urban = Some(UrbanTerrain {
+            population: 10000,
+            style: UrbanStyle::LowRise,
+        });
+        document.river_paths.push(RiverPath {
+            id: 1,
+            next_down: 0,
+            discharge: 50.,
+            stream_order: 4,
+            points_m: vec![[-5000., 3000.], [5000., 3000.]],
+        });
+        let original = document.height_field.elevations_m.clone();
+        let prepared = prepare(
+            Arc::new(document),
+            HeightSettings::default(),
+            &JobContext::default(),
+        )?;
+        assert_eq!(original, prepared.document.height_field.elevations_m);
+        assert!(
+            prepared
+                .models
+                .iter()
+                .any(|m| matches!(m.kind, ModelKind::Tree | ModelKind::Conifer))
+        );
+        assert_eq!(
+            prepared
+                .models
+                .iter()
+                .filter(|m| m.kind == ModelKind::Building)
+                .count(),
+            9
+        );
+        for model in &prepared.models {
+            let cell = &prepared.document.cells[model.cell_id as usize];
+            assert_eq!(point_hex(model.point_m, 2000.), cell.hex);
+            assert!(
+                prepared
+                    .geometry
+                    .hydrology
+                    .water_level(&prepared.document, model.point_m)
+                    .is_none()
+            );
+            let height =
+                terrain::height_at(cell, model.point_m, 2000., &prepared.geometry).unwrap();
+            assert!((model.position.y - height).abs() < 1e-6);
+            if model.kind == ModelKind::Building {
+                assert!(cell.urban.is_some());
+            }
+            if matches!(model.kind, ModelKind::Tree | ModelKind::Conifer) {
+                assert_eq!(cell.landscape, Landscape::Forest);
+                assert_eq!(cell.surface, Surface::Land);
+                assert!(cell.urban.is_none());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn urban_edits_use_complete_cells_and_preserve_rivers_and_source_settlements() {
@@ -709,6 +896,11 @@ mod tests {
             .insert_resource(Assets::<Mesh>::default())
             .insert_resource(Assets::<GizmoAsset>::default())
             .insert_resource(scene::SceneAssets::default())
+            .insert_resource({
+                let mut art = art::ArtLibrary::default();
+                art.ready = true;
+                art
+            })
             .insert_resource(Jobs {
                 active: Some(ActiveJob {
                     revision: if case == "stale" { 1 } else { 3 },

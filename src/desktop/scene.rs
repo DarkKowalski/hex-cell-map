@@ -39,25 +39,12 @@ pub struct DisplayMesh {
 pub struct SceneAssets {
     terrain: Handle<TerrainMaterial>,
     water: Handle<TerrainMaterial>,
-    tree: Handle<Mesh>,
-    trunk: Handle<Mesh>,
-    building: Handle<Mesh>,
-    roof: Handle<Mesh>,
-    rock: Handle<Mesh>,
-    grass: Handle<Mesh>,
-    shrub: Handle<Mesh>,
-    stone: Handle<StandardMaterial>,
-    foliage: [Handle<StandardMaterial>; 3],
-    bark: Handle<StandardMaterial>,
-    wall: [Handle<StandardMaterial>; 3],
-    roof_material: Handle<StandardMaterial>,
 }
 
 pub fn setup(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+    art: Res<art::ArtLibrary>,
 ) {
     commands.insert_resource(SceneAssets {
         terrain: terrain_materials.add(TerrainMaterial {
@@ -67,6 +54,8 @@ pub fn setup(
             },
             extension: TerrainBlend {
                 settings: Vec4::new(1., 0., 0., 0.),
+                color: art.color.clone(),
+                detail: art.detail.clone(),
             },
         }),
         water: terrain_materials.add(TerrainMaterial {
@@ -76,30 +65,10 @@ pub fn setup(
             },
             extension: TerrainBlend {
                 settings: Vec4::new(1., 1., 0., 0.),
+                color: art.color.clone(),
+                detail: art.detail.clone(),
             },
         }),
-        rock: meshes.add(Sphere::new(0.5).mesh().ico(1).unwrap()),
-        grass: meshes.add(Cone::new(0.75, 0.3)),
-        shrub: meshes.add(Sphere::new(0.5).mesh().ico(1).unwrap()),
-        stone: materials.add(Color::srgb(0.39, 0.36, 0.30)),
-        tree: meshes.add(Cone::new(0.55, 1.5)),
-        trunk: meshes.add(Cylinder::new(0.07, 0.7)),
-        building: meshes.add(Cuboid::new(0.8, 0.85, 0.6)),
-        roof: meshes.add(Cone::new(0.62, 0.5).mesh().resolution(4)),
-        foliage: [
-            Color::srgb(0.16, 0.29, 0.10),
-            Color::srgb(0.10, 0.23, 0.13),
-            Color::srgb(0.24, 0.32, 0.13),
-        ]
-        .map(|c| materials.add(c)),
-        bark: materials.add(Color::srgb(0.28, 0.19, 0.105)),
-        wall: [
-            Color::srgb(0.59, 0.54, 0.43),
-            Color::srgb(0.68, 0.61, 0.48),
-            Color::srgb(0.46, 0.48, 0.47),
-        ]
-        .map(|c| materials.add(c)),
-        roof_material: materials.add(Color::srgb(0.49, 0.19, 0.095)),
     });
     commands.spawn((
         Camera3d::default(),
@@ -126,6 +95,7 @@ pub(super) fn install(
     meshes: &mut Assets<Mesh>,
     gizmo_assets: &mut Assets<GizmoAsset>,
     assets: &SceneAssets,
+    art: &art::ArtLibrary,
     prepared: &PreparedMap,
 ) {
     for (is_water, chunk) in prepared
@@ -142,6 +112,22 @@ pub(super) fn install(
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, chunk.positions.clone());
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, chunk.normals.clone());
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, chunk.weights.clone());
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_UV_0,
+            chunk
+                .materials
+                .iter()
+                .map(|w| [w[0], w[1]])
+                .collect::<Vec<_>>(),
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_UV_1,
+            chunk
+                .materials
+                .iter()
+                .map(|w| [w[2], w[3]])
+                .collect::<Vec<_>>(),
+        );
         mesh.insert_indices(Indices::U32(chunk.indices.clone()));
         commands.spawn((
             MapEntity,
@@ -206,69 +192,19 @@ pub(super) fn install(
         ));
     }
     for model in &prepared.models {
-        let single = match model.kind {
-            ModelKind::Rock => Some((&assets.rock, &assets.stone, Vec3::new(1., 0.65, 0.8), 0.325)),
-            ModelKind::Shrub => Some((
-                &assets.shrub,
-                &assets.foliage[model.variant],
-                Vec3::new(1., 0.75, 1.),
-                0.375,
-            )),
-            ModelKind::Grass => Some((
-                &assets.grass,
-                &assets.foliage[model.variant],
-                Vec3::new(1., 1., 1.),
-                0.15,
-            )),
-            _ => None,
-        };
-        if let Some((mesh, material, scale, height)) = single {
+        let variants = &art.models[&model.kind];
+        let prefab = &variants[model.variant % variants.len()];
+        for part in &prefab.parts {
             commands.spawn((
                 MapEntity,
                 EnvironmentModel {
                     cell_id: model.cell_id,
                     point_m: model.point_m,
-                    offset: height * model.scale,
+                    offset: 0.,
                 },
-                Mesh3d(mesh.clone()),
-                MeshMaterial3d(material.clone()),
-                Transform::from_translation(model.position + Vec3::Y * height * model.scale)
-                    .with_scale(scale * model.scale)
-                    .with_rotation(Quat::from_rotation_y(model.yaw)),
-            ));
-            continue;
-        }
-        let (parts, mesh, material, upper_mesh, upper_material) = match model.kind {
-            ModelKind::Tree => (
-                [0.35, 1.15],
-                &assets.trunk,
-                &assets.bark,
-                &assets.tree,
-                &assets.foliage[model.variant],
-            ),
-            ModelKind::Building => (
-                [0.425, 1.10],
-                &assets.building,
-                &assets.wall[model.variant],
-                &assets.roof,
-                &assets.roof_material,
-            ),
-            _ => unreachable!(),
-        };
-        for (height, mesh, material) in [
-            (parts[0], mesh, material),
-            (parts[1], upper_mesh, upper_material),
-        ] {
-            commands.spawn((
-                MapEntity,
-                EnvironmentModel {
-                    cell_id: model.cell_id,
-                    point_m: model.point_m,
-                    offset: height * model.scale,
-                },
-                Mesh3d(mesh.clone()),
-                MeshMaterial3d(material.clone()),
-                Transform::from_translation(model.position + Vec3::Y * height * model.scale)
+                Mesh3d(part.mesh.clone()),
+                MeshMaterial3d(part.material.clone()),
+                Transform::from_translation(model.position)
                     .with_scale(Vec3::splat(model.scale))
                     .with_rotation(Quat::from_rotation_y(model.yaw)),
             ));
@@ -538,8 +474,10 @@ pub fn smoke_validation(
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
     time: Res<Time>,
-    orbit: Res<OrbitCamera>,
+    mut orbit: ResMut<OrbitCamera>,
     cameras: Query<(&Camera, &GlobalTransform), With<MapCamera>>,
+    art: Res<art::ArtLibrary>,
+    models: Query<&Mesh3d, With<EnvironmentModel>>,
 ) {
     if !options.smoke {
         return;
@@ -558,10 +496,42 @@ pub fn smoke_validation(
         return;
     };
     options.ready_frames += 1;
+    if options.ready_frames == 1 {
+        if let Some(hex) = options.focus {
+            let Some(cell) = document.cell(hex) else {
+                error!("Smoke focus hex is outside the document");
+                exit.write(AppExit::error());
+                return;
+            };
+            orbit.target_goal.x = (cell.center_m[0] / 1000.) as f32;
+            orbit.target_goal.z = (-cell.center_m[1] / 1000.) as f32;
+            orbit.target = orbit.target_goal;
+        }
+        if let Some(distance) = options.distance {
+            orbit.distance_goal = distance;
+            orbit.distance = distance;
+        }
+    }
     if options.ready_frames < 90 || options.capture_started {
         return;
     }
     if !options.picking_checked {
+        let imported: std::collections::BTreeSet<_> = art
+            .models
+            .values()
+            .flatten()
+            .flat_map(|p| p.parts.iter().map(|p| p.mesh.id()))
+            .collect();
+        if !art.ready || models.is_empty() || models.iter().any(|m| !imported.contains(&m.0.id())) {
+            error!("Smoke failed: imported art did not populate the map");
+            exit.write(AppExit::error());
+            return;
+        }
+        info!(
+            "SMOKE: {} imported model parts from {} GLB prefabs; PBR texture arrays ready",
+            models.iter().count(),
+            art.models.values().map(Vec::len).sum::<usize>()
+        );
         let filter = |entity| chunks.contains(entity);
         let settings = MeshRayCastSettings::default()
             .with_filter(&filter)

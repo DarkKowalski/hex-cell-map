@@ -170,6 +170,10 @@ pub fn show(
                     for source in &document.sources { ui.separator(); ui.strong(format!("{} · {}", source.name, source.version)); ui.label(&source.attribution); ui.hyperlink_to("Source data", &source.url); ui.hyperlink_to("License & terms", &source.license); ui.small(format!("Acquired Unix time: {} · SHA-256: {}", source.acquired_unix, source.sha256)); }
                 }
                 ui.separator(); ui.label("Overview: Natural Earth, public domain.");
+                ui.separator(); ui.strong("Art assets · CC0");
+                ui.hyperlink_to("Kenney Nature Kit", "https://kenney.nl/assets/nature-kit");
+                ui.hyperlink_to("Kenney City Kit (Suburban)", "https://kenney.nl/assets/city-kit-suburban");
+                ui.hyperlink_to("Poly Haven terrain materials", "https://polyhaven.com/license");
             });
         });
     }
