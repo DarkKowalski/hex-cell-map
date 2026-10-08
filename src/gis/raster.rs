@@ -53,6 +53,33 @@ pub struct RasterLayer {
 }
 
 impl RasterLayer {
+    pub fn sample_bilinear(&self, lon: f64, lat: f64) -> Option<f64> {
+        let window = self.windows.iter().find(|w| {
+            lon >= w.bounds[0] && lon < w.bounds[2] && lat > w.bounds[1] && lat <= w.bounds[3]
+        })?;
+        let dx = (window.bounds[2] - window.bounds[0]) / window.width as f64;
+        let dy = (window.bounds[3] - window.bounds[1]) / window.height as f64;
+        let x = (lon - window.bounds[0]) / dx - 0.5;
+        let y = (lat - window.bounds[1]) / dy - 0.5;
+        let x0 = x.floor();
+        let y0 = y.floor();
+        let tx = x - x0;
+        let ty = y - y0;
+        let mut weighted = 0.;
+        let mut total = 0.;
+        for (sx, wx) in [(x0, 1. - tx), (x0 + 1., tx)] {
+            for (sy, wy) in [(y0, 1. - ty), (y0 + 1., ty)] {
+                if let Some(value) = self.sample(
+                    window.bounds[0] + (sx + 0.5) * dx,
+                    window.bounds[1] + (sy + 0.5) * dy,
+                ) {
+                    weighted += value * wx * wy;
+                    total += wx * wy;
+                }
+            }
+        }
+        (total > 0.).then(|| weighted / total)
+    }
     pub fn sample(&self, lon: f64, lat: f64) -> Option<f64> {
         self.windows.iter().find_map(|w| w.sample(lon, lat))
     }
@@ -96,10 +123,10 @@ pub fn acquire(
         for lon in (west..region.east.ceil() as i32).step_by(tile_degrees as usize) {
             context.check()?;
             let tile = tile_name(lon, lat, kind);
-            if let Some(index) = &dem_index {
-                if !index.contains(&tile) {
-                    continue;
-                }
+            if let Some(index) = &dem_index
+                && !index.contains(&tile)
+            {
+                continue;
             }
             let url = match kind {
                 RasterKind::Elevation => {
@@ -109,7 +136,7 @@ pub fn acquire(
                     "https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/{tile}.tif"
                 ),
             };
-            let key = Cache::key(&("raster-window-v1", &url, region, resolution_m))?;
+            let key = Cache::key(&("raster-window-v2", &url, region, resolution_m))?;
             let filename = format!("raster-{key}.json");
             if let Some(window) = cache.read_json::<RasterWindow>(&filename)? {
                 ensure!(
@@ -170,21 +197,16 @@ pub fn acquire(
                 RasterKind::Elevation => ResampleAlg::Average,
                 RasterKind::LandCover => ResampleAlg::NearestNeighbour,
             };
-            // Read strips to provide cancellation opportunities during large COG reads.
-            let mut values = Vec::with_capacity(width * height);
-            for row in (0..height).step_by(64) {
-                context.check()?;
-                let rows = (height - row).min(64);
-                let source_start = y0 + row * (y1 - y0) / height;
-                let source_end = y0 + (row + rows) * (y1 - y0) / height;
-                let buffer = band.read_as::<f32>(
-                    (x0 as isize, source_start as isize),
-                    (x1 - x0, source_end - source_start),
-                    (width, rows),
-                    Some(resampling),
-                )?;
-                values.extend_from_slice(buffer.data());
-            }
+            // One resampling grid avoids integer-rounded strip boundaries. GDAL's
+            // progress callback checks cancellation during the bounded range reads.
+            let values = read_cancellable(
+                &band,
+                (x0, y0),
+                (x1 - x0, y1 - y0),
+                (width, height),
+                resampling,
+                context,
+            )?;
             let nodata = band.no_data_value().map(|v| v as f32);
             let payload_path = cache.root.join(format!("raster-{key}.samples"));
             // The hash covers acquired sample values, not the unread portion of the COG.
@@ -228,6 +250,128 @@ pub fn acquire(
         }
     }
     Ok(RasterLayer { windows })
+}
+
+fn read_cancellable(
+    band: &gdal::raster::RasterBand<'_>,
+    origin: (usize, usize),
+    size: (usize, usize),
+    shape: (usize, usize),
+    resampling: ResampleAlg,
+    context: &JobContext,
+) -> Result<Vec<f32>> {
+    use gdal_sys::{CPLErr, GDALDataType, GDALRWFlag};
+    unsafe extern "C" fn progress(
+        _: f64,
+        _: *const std::ffi::c_char,
+        data: *mut std::ffi::c_void,
+    ) -> i32 {
+        // SAFETY: data points to the borrowed JobContext for the synchronous call.
+        let context = unsafe { &*data.cast::<JobContext>() };
+        i32::from(context.check().is_ok())
+    }
+    let mut options = gdal_sys::GDALRasterIOExtraArg {
+        nVersion: 2,
+        eResampleAlg: resampling as u32,
+        pfnProgress: Some(progress),
+        pProgressData: std::ptr::from_ref(context).cast_mut().cast(),
+        bFloatingPointWindowValidity: 0,
+        dfXOff: 0.,
+        dfYOff: 0.,
+        dfXSize: 0.,
+        dfYSize: 0.,
+        bUseOnlyThisScale: 0,
+    };
+    let mut values = vec![0_f32; shape.0 * shape.1];
+    // SAFETY: the band remains alive, dimensions are checked conversions, the
+    // output holds shape.0 * shape.1 f32 values, and callback data outlives the call.
+    let result = unsafe {
+        gdal_sys::GDALRasterIOEx(
+            band.c_rasterband(),
+            GDALRWFlag::GF_Read,
+            origin.0.try_into()?,
+            origin.1.try_into()?,
+            size.0.try_into()?,
+            size.1.try_into()?,
+            values.as_mut_ptr().cast(),
+            shape.0.try_into()?,
+            shape.1.try_into()?,
+            GDALDataType::GDT_Float32,
+            0,
+            0,
+            &mut options,
+        )
+    };
+    context.check()?;
+    if result != CPLErr::CE_None {
+        // SAFETY: GDAL owns a null-terminated thread-local error string.
+        let message =
+            unsafe { std::ffi::CStr::from_ptr(gdal_sys::CPLGetLastErrorMsg()) }.to_string_lossy();
+        anyhow::bail!("Raster read failed: {message}");
+    }
+    Ok(values)
+}
+
+/// Compare processed windows against an independent gdal-rs RasterIO call using
+/// the identical footprint and resampling. Used only by the real-data probe.
+pub fn audit_references(
+    cache: &Cache,
+    sources: &[SourceRecord],
+    context: &JobContext,
+) -> Result<usize> {
+    let mut checked = 0;
+    for entry in fs::read_dir(&cache.root)? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .starts_with("raster-")
+            || path.extension().is_none_or(|e| e != "json")
+        {
+            continue;
+        }
+        let window: RasterWindow = serde_json::from_reader(fs::File::open(&path)?)?;
+        if !sources
+            .iter()
+            .any(|s| s.sha256 == window.source.sha256 && s.url == window.source.url)
+        {
+            continue;
+        }
+        context.check()?;
+        let dataset = Dataset::open(format!("/vsicurl/{}", window.source.url))?;
+        let t = dataset.geo_transform()?;
+        let x = ((window.bounds[0] - t[0]) / t[1]).round() as isize;
+        let y = ((window.bounds[3] - t[3]) / t[5]).round() as isize;
+        let width = ((window.bounds[2] - window.bounds[0]) / t[1]).round() as usize;
+        let height = ((window.bounds[1] - window.bounds[3]) / t[5]).round() as usize;
+        let algorithm = if window.source.name == "ESA WorldCover" {
+            ResampleAlg::NearestNeighbour
+        } else {
+            ResampleAlg::Average
+        };
+        let reference = dataset.rasterband(1)?.read_as::<f32>(
+            (x, y),
+            (width, height),
+            (window.width, window.height),
+            Some(algorithm),
+        )?;
+        let max_error = reference
+            .data()
+            .iter()
+            .zip(&window.values)
+            .filter(|(a, b)| a.is_finite() && b.is_finite())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0_f32, f32::max);
+        ensure!(
+            max_error <= 0.001,
+            "GDAL reference differs by {max_error}: {}",
+            window.source.url
+        );
+        checked += 1;
+    }
+    ensure!(checked > 0, "No acquired raster windows to audit");
+    Ok(checked)
 }
 
 pub fn tile_name(lon: i32, lat: i32, kind: RasterKind) -> String {

@@ -23,7 +23,7 @@ pub fn generate(
     let projection = Projection::new(settings.region)?;
     let (mut cells, bounds_m) = build_grid(settings, &projection)?;
     let spacing = settings.spacing_km * 1000.;
-    let padding_degrees = spacing
+    let padding_degrees = spacing * 3.
         / 100_000.
         / settings
             .region
@@ -33,6 +33,11 @@ pub fn generate(
             .to_radians()
             .cos();
     let input_region = settings.region.expanded(padding_degrees);
+    ensure!(
+        settings.region.west - padding_degrees >= -180.
+            && settings.region.east + padding_degrees <= 180.,
+        "Region's boundary hexes cross the antimeridian; move the bounds inward"
+    );
     let elevation = raster::acquire(
         cache,
         input_region,
@@ -92,15 +97,18 @@ pub fn generate(
             )
         })
         .collect();
+    let height_field =
+        source_height_field(&cells, spacing, &projection, &elevation, &cover, context)?;
     let mut document = MapDocument {
         schema_version: 1,
-        generator_version: "gis-hex-v1".into(),
+        generator_version: "gis-hex-v2".into(),
         settings: settings.clone(),
         projection_wkt: projection.wkt,
         bounds_m,
         cells,
         sources,
         river_network: river_network.into_values().collect(),
+        height_field,
         index,
     };
     document.rebuild_index()?;
@@ -112,6 +120,71 @@ pub fn generate(
         ),
     )?;
     Ok(document)
+}
+
+fn source_height_field(
+    cells: &[Cell],
+    spacing: f64,
+    projection: &Projection,
+    elevation: &RasterLayer,
+    cover: &RasterLayer,
+    context: &JobContext,
+) -> Result<HeightField> {
+    context.report(0.93, "Sampling continuous DEM surface")?;
+    let step = spacing / 4.;
+    let radius = spacing / 3_f64.sqrt();
+    let min_x = cells
+        .iter()
+        .map(|c| c.center_m[0] - radius - step)
+        .fold(f64::INFINITY, f64::min);
+    let min_y = cells
+        .iter()
+        .map(|c| c.center_m[1] - radius - step)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = cells
+        .iter()
+        .map(|c| c.center_m[0] + radius + step)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let max_y = cells
+        .iter()
+        .map(|c| c.center_m[1] + radius + step)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let origin_m = [(min_x / step).floor() * step, (min_y / step).floor() * step];
+    let width = ((max_x - origin_m[0]) / step).ceil() as usize + 1;
+    let height = ((max_y - origin_m[1]) / step).ceil() as usize + 1;
+    ensure!(
+        width * height <= 2_000_000,
+        "Continuous DEM surface exceeds sample limit"
+    );
+    let mut elevations_m = Vec::with_capacity(width * height);
+    for row in 0..height {
+        context.check()?;
+        let mut positions: Vec<_> = (0..width)
+            .map(|col| {
+                [
+                    origin_m[0] + col as f64 * step,
+                    origin_m[1] + row as f64 * step,
+                ]
+            })
+            .collect();
+        projection.unproject(&mut positions)?;
+        for [lon, lat] in positions {
+            let value = elevation
+                .sample_bilinear(lon, lat)
+                .or_else(|| (cover.sample(lon, lat) == Some(80.)).then_some(0.))
+                .with_context(|| {
+                    format!("Missing continuous DEM coverage at {lat:.5}°, {lon:.5}°")
+                })?;
+            elevations_m.push(value as f32);
+        }
+    }
+    Ok(HeightField {
+        origin_m,
+        step_m: step,
+        width,
+        height,
+        elevations_m,
+    })
 }
 
 fn aggregate_cells(
@@ -230,16 +303,16 @@ pub fn rasterize_rivers(
                 let q1 = (max_x / spacing - f64::from(r) / 2.).ceil() as i32 + 1;
                 for q in q0..=q1 {
                     let hex = Hex::new(q, r);
-                    if let Some(&i) = index.get(&hex) {
-                        if line.intersects(&hex_polygon(hex, spacing)) {
-                            let cell = &mut cells[i];
-                            if !cell.river_ids.contains(&reach.id) {
-                                cell.river_ids.push(reach.id);
-                            }
-                            // Lakes and coastal water remain open water; river identity is retained.
-                            if cell.surface != Surface::Water {
-                                cell.surface = Surface::River;
-                            }
+                    if let Some(&i) = index.get(&hex)
+                        && line.intersects(&hex_polygon(hex, spacing))
+                    {
+                        let cell = &mut cells[i];
+                        if !cell.river_ids.contains(&reach.id) {
+                            cell.river_ids.push(reach.id);
+                        }
+                        // Lakes and coastal water remain open water; river identity is retained.
+                        if cell.surface != Surface::Water {
+                            cell.surface = Surface::River;
                         }
                     }
                 }

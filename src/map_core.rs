@@ -41,9 +41,9 @@ impl Region {
     pub fn expanded(self, degrees: f64) -> Self {
         Self {
             west: (self.west - degrees).max(-180.),
-            south: (self.south - degrees).max(-60.),
+            south: (self.south - degrees).max(-89.),
             east: (self.east + degrees).min(180.),
-            north: (self.north + degrees).min(60.),
+            north: (self.north + degrees).min(89.),
         }
     }
 }
@@ -248,8 +248,38 @@ pub struct MapDocument {
     pub cells: Vec<Cell>,
     pub sources: Vec<SourceRecord>,
     pub river_network: Vec<RiverRecord>,
+    pub height_field: HeightField,
     #[serde(skip)]
     pub index: HashMap<Hex, usize>,
+}
+
+/// Projected DEM samples independent of the gameplay hex grid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeightField {
+    pub origin_m: [f64; 2],
+    pub step_m: f64,
+    pub width: usize,
+    pub height: usize,
+    pub elevations_m: Vec<f32>,
+}
+
+impl HeightField {
+    pub fn sample(&self, point: [f64; 2]) -> Option<f64> {
+        let x = (point[0] - self.origin_m[0]) / self.step_m;
+        let y = (point[1] - self.origin_m[1]) / self.step_m;
+        if x < 0. || y < 0. || x > (self.width - 1) as f64 || y > (self.height - 1) as f64 {
+            return None;
+        }
+        let ix = (x.floor() as usize).min(self.width - 2);
+        let iy = (y.floor() as usize).min(self.height - 2);
+        let tx = x - ix as f64;
+        let ty = y - iy as f64;
+        let at = |dx, dy| f64::from(self.elevations_m[(iy + dy) * self.width + ix + dx]);
+        Some(
+            (at(0, 0) * (1. - tx) + at(1, 0) * tx) * (1. - ty)
+                + (at(0, 1) * (1. - tx) + at(1, 1) * tx) * ty,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -262,6 +292,17 @@ pub struct RiverRecord {
 
 impl MapDocument {
     pub fn rebuild_index(&mut self) -> Result<()> {
+        let field = &self.height_field;
+        ensure!(
+            field.width >= 2
+                && field.height >= 2
+                && field.width.checked_mul(field.height) == Some(field.elevations_m.len())
+                && field.elevations_m.len() <= 2_000_000
+                && field.step_m.is_finite()
+                && field.step_m > 0.
+                && field.elevations_m.iter().all(|h| h.is_finite()),
+            "Invalid source height field"
+        );
         ensure!(self.schema_version == 1, "Unsupported cached map schema");
         ensure!(
             self.cells.len() <= MAX_CELLS && !self.cells.is_empty(),

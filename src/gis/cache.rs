@@ -1,6 +1,6 @@
 use crate::{jobs::JobContext, map_core::SourceRecord};
 use anyhow::{Context, Result, ensure};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
@@ -13,6 +13,13 @@ use std::{
 pub struct Cache {
     pub root: PathBuf,
     agent: ureq::Agent,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DownloadMetadata {
+    url: String,
+    etag: Option<String>,
+    acquired_unix: u64,
 }
 
 impl Cache {
@@ -76,7 +83,8 @@ impl Cache {
         context.check()?;
         let path = self.root.join(filename);
         if path.is_file() && fs::metadata(&path)?.len() > 0 {
-            return Ok((path, None));
+            let metadata = self.read_json::<DownloadMetadata>(&format!("{filename}.http.json"))?;
+            return Ok((path, metadata.and_then(|m| m.etag)));
         }
         let mut last_error = None;
         for attempt in 0..3 {
@@ -85,7 +93,17 @@ impl Cache {
                 format!("Downloading {filename} (attempt {})", attempt + 1),
             )?;
             match self.download_once(url, &path, context, progress) {
-                Ok(etag) => return Ok((path, etag)),
+                Ok(etag) => {
+                    self.write_json(
+                        &format!("{filename}.http.json"),
+                        &DownloadMetadata {
+                            url: url.into(),
+                            etag: etag.clone(),
+                            acquired_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+                        },
+                    )?;
+                    return Ok((path, etag));
+                }
                 Err(error) => {
                     context.check()?;
                     last_error = Some(error);
@@ -232,13 +250,28 @@ pub fn source_record(
         }
         hasher.update(&buffer[..size]);
     }
+    let metadata_path = path.with_file_name(format!(
+        "{}.http.json",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let metadata = File::open(metadata_path)
+        .ok()
+        .and_then(|f| serde_json::from_reader::<_, DownloadMetadata>(f).ok())
+        .filter(|m| m.url == url);
+    let acquired_unix = match metadata {
+        Some(m) => m.acquired_unix,
+        None => fs::metadata(path)?
+            .modified()?
+            .duration_since(UNIX_EPOCH)?
+            .as_secs(),
+    };
     Ok(SourceRecord {
         name: name.into(),
         version: version.into(),
         url: url.into(),
         license: license.into(),
         attribution: attribution.into(),
-        acquired_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        acquired_unix,
         etag,
         sha256: format!("{:x}", hasher.finalize()),
     })

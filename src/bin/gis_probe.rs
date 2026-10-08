@@ -10,6 +10,7 @@ fn main() -> Result<()> {
     let mut cache_path = Cache::default_path();
     let mut output = None;
     let mut repeat = false;
+    let mut audit = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -54,6 +55,7 @@ fn main() -> Result<()> {
             "--cache" => cache_path = PathBuf::from(args.next().context("Missing cache path")?),
             "--output" => output = Some(PathBuf::from(args.next().context("Missing output path")?)),
             "--repeat" => repeat = true,
+            "--audit-raster" => audit = true,
             "--check-environment" => {
                 check_environment()?;
                 return Ok(());
@@ -77,7 +79,13 @@ fn main() -> Result<()> {
     });
     let start = Instant::now();
     let document = generation::generate(&settings, &cache, &context)?;
-    validate(&document)?;
+    validate(&document, &cache, &context)?;
+    if audit {
+        println!(
+            "{} raster windows match independent GDAL RasterIO within 0.001",
+            hex_cell_map::gis::raster::audit_references(&cache, &document.sources, &context)?
+        );
+    }
     let digest = cell_digest(&document)?;
     println!(
         "{} cells, {} chunks, {:?}; {:.2}s; canonical SHA-256 {digest}",
@@ -138,7 +146,7 @@ fn check_environment() -> Result<()> {
     Ok(())
 }
 
-fn validate(document: &MapDocument) -> Result<()> {
+fn validate(document: &MapDocument, cache: &Cache, context: &JobContext) -> Result<()> {
     let spacing = document.settings.spacing_km * 1000.;
     let projection = Projection::new(document.settings.region)?;
     for cell in &document.cells {
@@ -156,6 +164,22 @@ fn validate(document: &MapDocument) -> Result<()> {
     }
     let mut checked = 0;
     let mut clipped = 0;
+    let region = document.settings.region;
+    let padding = spacing
+        / 100_000.
+        / region
+            .north
+            .abs()
+            .max(region.south.abs())
+            .to_radians()
+            .cos();
+    let (geometries, _) = hex_cell_map::gis::vectors::rivers(
+        cache,
+        region.expanded(padding),
+        &projection,
+        document.settings.min_river_discharge,
+        context,
+    )?;
     for reach in &document.river_network {
         let hexes: HashSet<_> = document
             .cells
@@ -182,6 +206,16 @@ fn validate(document: &MapDocument) -> Result<()> {
         if seen.len() == hexes.len() {
             checked += 1;
         } else {
+            let outside = geometries.iter().filter(|r| r.id == reach.id).any(|r| {
+                r.points_m
+                    .iter()
+                    .any(|p| !document.index.contains_key(&point_hex(*p, spacing)))
+            });
+            ensure!(
+                outside,
+                "Fully covered river reach {} has a gap in its cell chain",
+                reach.id
+            );
             clipped += 1;
         }
     }
