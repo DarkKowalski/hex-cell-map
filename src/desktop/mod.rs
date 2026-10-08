@@ -47,6 +47,8 @@ pub struct MapView {
     pub corners: BTreeMap<terrain::VertexKey, terrain::Corner>,
     pub heights: HeightSettings,
     pub triangles: Vec<Vec<[terrain::VertexKey; 3]>>,
+    pub outlines: Vec<Vec<terrain::VertexKey>>,
+    pub outline_water: BTreeMap<terrain::VertexKey, f64>,
     pub revision: u64,
     pub selected: Option<u32>,
     pub hovered: Option<u32>,
@@ -142,6 +144,9 @@ struct PreparedMap {
 pub enum ModelKind {
     Tree,
     Building,
+    Rock,
+    Shrub,
+    Grass,
 }
 
 pub struct ModelPlacement {
@@ -150,6 +155,8 @@ pub struct ModelPlacement {
     scale: f32,
     yaw: f32,
     variant: usize,
+    cell_id: u32,
+    point_m: [f64; 2],
 }
 
 #[derive(Resource, Default)]
@@ -157,6 +164,7 @@ struct LaunchOptions {
     input: Option<PathBuf>,
     screenshot: Option<PathBuf>,
     smoke: bool,
+    outlines: bool,
     ready_frames: u32,
     capture_started: bool,
     picking_checked: bool,
@@ -173,6 +181,7 @@ pub fn run() -> Result<()> {
                 ))
             }
             "--smoke" => options.smoke = true,
+            "--outlines" => options.outlines = true,
             "--screenshot" => {
                 options.screenshot = Some(PathBuf::from(
                     args.next().context("Missing screenshot path")?,
@@ -180,7 +189,7 @@ pub fn run() -> Result<()> {
             }
             "--help" => {
                 println!(
-                    "hex-cell-map [--preview GIS_PROBE_JSON] [--smoke --screenshot FILE.png]\nGenerate real GIS maps using the native window. Preview inputs are development validation artifacts, not portable user projects."
+                    "hex-cell-map [--preview GIS_PROBE_JSON] [--smoke --screenshot FILE.png] [--outlines]\nGenerate real GIS maps using the native window. Preview inputs are development validation artifacts, not portable user projects."
                 );
                 return Ok(());
             }
@@ -193,6 +202,7 @@ pub fn run() -> Result<()> {
             "Smoke validation requires --preview and --screenshot"
         );
     }
+    let grid = options.outlines;
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
@@ -206,12 +216,12 @@ pub fn run() -> Result<()> {
     .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
     .insert_resource(ClearColor(Color::srgb(0.075, 0.095, 0.12)))
     .insert_resource(GlobalAmbientLight {
-        brightness: 450.,
+        brightness: 100.,
         ..default()
     })
     .insert_resource(options)
     .init_resource::<MapView>()
-    .init_resource::<UiState>()
+    .insert_resource(UiState { grid, ..default() })
     .init_resource::<Jobs>()
     .init_resource::<OrbitCamera>()
     .add_systems(Startup, (scene::setup, ui::setup, launch_preview).chain())
@@ -223,6 +233,7 @@ pub fn run() -> Result<()> {
             start_jobs,
             camera::animate,
             scene::models_visibility,
+            scene::grid_visibility,
         )
             .chain(),
     )
@@ -403,6 +414,7 @@ fn poll_jobs(
     mut commands: Commands,
     old: Query<Entity, With<scene::MapEntity>>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut gizmo_assets: ResMut<Assets<GizmoAsset>>,
     assets: Res<scene::SceneAssets>,
 ) {
     let Some(job) = jobs.active.as_mut() else {
@@ -436,7 +448,13 @@ fn poll_jobs(
                     for entity in &old {
                         commands.entity(entity).despawn();
                     }
-                    scene::install(&mut commands, &mut meshes, &assets, &prepared);
+                    scene::install(
+                        &mut commands,
+                        &mut meshes,
+                        &mut gizmo_assets,
+                        &assets,
+                        &prepared,
+                    );
                     if refit {
                         orbit.fit(&prepared.document, prepared.geometry.heights);
                         view.selected = None;
@@ -452,6 +470,17 @@ fn poll_jobs(
                             .sum::<usize>()
                     );
                     view.heights = prepared.geometry.heights;
+                    view.outlines = prepared.geometry.outlines;
+                    view.outline_water = prepared
+                        .geometry
+                        .water_chunks
+                        .iter()
+                        .flat_map(|c| {
+                            c.boundaries
+                                .iter()
+                                .map(|(k, v)| (*k, v.display.samples[0].height))
+                        })
+                        .collect();
                     view.triangles = prepared.geometry.triangles;
                     view.corners = prepared.geometry.corners;
                     view.document = Some(prepared.document);
@@ -512,6 +541,43 @@ fn prepare(
                             * (0.075 + 0.035 * (seed % 10) as f32 / 10.),
                         yaw: angle as f32,
                         variant: seed as usize % 3,
+                        cell_id: cell.id,
+                        point_m: p,
+                    });
+                }
+            }
+        }
+        if cell.urban.is_none() && cell.surface != Surface::Water && models.len() < 60_000 {
+            for n in 0..2_u64 {
+                let seed = (u64::from(cell.id) * 3571 + n * 7919 + 97) % 65521;
+                let angle = seed as f64 * 0.61803398875 * std::f64::consts::TAU;
+                let radius = spacing * (0.15 + 0.2 * (seed % 100) as f64 / 100.);
+                let p = [
+                    cell.center_m[0] + radius * angle.cos(),
+                    cell.center_m[1] + radius * angle.sin(),
+                ];
+                if geometry.hydrology.water_level(&document, p).is_some() {
+                    continue;
+                }
+                let cover = document.height_field.cover_weights(p);
+                let kind = if cover[5] > 0.4 || (cell.slope_degrees > 20. && cover[6] < 0.4) {
+                    ModelKind::Rock
+                } else if cover[0] + cover[1] > 0.4 {
+                    ModelKind::Shrub
+                } else if cover[2] + cover[3] > 0.4 {
+                    ModelKind::Grass
+                } else {
+                    continue;
+                };
+                if let Some(h) = terrain::height_at(cell, p, spacing, &geometry) {
+                    models.push(ModelPlacement {
+                        kind,
+                        position: Vec3::new((p[0] / 1000.) as f32, h, (-p[1] / 1000.) as f32),
+                        scale: document.settings.spacing_km as f32 * 0.05,
+                        yaw: angle as f32,
+                        variant: seed as usize % 3,
+                        cell_id: cell.id,
+                        point_m: p,
                     });
                 }
             }
@@ -548,6 +614,8 @@ fn prepare(
                         scale,
                         yaw: 0.,
                         variant: seed as usize % 3,
+                        cell_id: cell.id,
+                        point_m: p,
                     });
                 }
             }
@@ -623,6 +691,7 @@ mod tests {
                             heights: HeightSettings::default(),
                             water_chunks: vec![],
                             triangles: vec![],
+                            outlines: vec![],
                             hydrology: Default::default(),
                         },
                         models: vec![],
@@ -638,6 +707,7 @@ mod tests {
             .insert_resource(UiState::default())
             .insert_resource(OrbitCamera::default())
             .insert_resource(Assets::<Mesh>::default())
+            .insert_resource(Assets::<GizmoAsset>::default())
             .insert_resource(scene::SceneAssets::default())
             .insert_resource(Jobs {
                 active: Some(ActiveJob {

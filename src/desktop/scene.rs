@@ -20,13 +20,19 @@ pub struct TerrainChunk {
 
 #[derive(Component)]
 pub struct EnvironmentModel {
-    pub raw_ground: f64,
+    pub cell_id: u32,
+    pub point_m: [f64; 2],
     pub offset: f32,
 }
 #[derive(Component)]
+pub struct GridLines {
+    handle: Handle<GizmoAsset>,
+    segments: Vec<[terrain::VertexKey; 2]>,
+}
+
+#[derive(Component)]
 pub struct DisplayMesh {
-    heights: Vec<f64>,
-    gradients: Vec<[f32; 2]>,
+    vertices: Vec<crate::elevation::DisplayVertex>,
 }
 
 #[derive(Resource, Default)]
@@ -37,6 +43,10 @@ pub struct SceneAssets {
     trunk: Handle<Mesh>,
     building: Handle<Mesh>,
     roof: Handle<Mesh>,
+    rock: Handle<Mesh>,
+    grass: Handle<Mesh>,
+    shrub: Handle<Mesh>,
+    stone: Handle<StandardMaterial>,
     foliage: [Handle<StandardMaterial>; 3],
     bark: Handle<StandardMaterial>,
     wall: [Handle<StandardMaterial>; 3],
@@ -68,6 +78,10 @@ pub fn setup(
                 settings: Vec4::new(1., 1., 0., 0.),
             },
         }),
+        rock: meshes.add(Sphere::new(0.5).mesh().ico(1).unwrap()),
+        grass: meshes.add(Cone::new(0.75, 0.3)),
+        shrub: meshes.add(Sphere::new(0.5).mesh().ico(1).unwrap()),
+        stone: materials.add(Color::srgb(0.39, 0.36, 0.30)),
         tree: meshes.add(Cone::new(0.55, 1.5)),
         trunk: meshes.add(Cylinder::new(0.07, 0.7)),
         building: meshes.add(Cuboid::new(0.8, 0.85, 0.6)),
@@ -99,7 +113,7 @@ pub fn setup(
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.,
+            illuminance: 8_000.,
             shadow_maps_enabled: false,
             ..default()
         },
@@ -110,6 +124,7 @@ pub fn setup(
 pub(super) fn install(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
+    gizmo_assets: &mut Assets<GizmoAsset>,
     assets: &SceneAssets,
     prepared: &PreparedMap,
 ) {
@@ -128,26 +143,10 @@ pub(super) fn install(
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, chunk.normals.clone());
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, chunk.weights.clone());
         mesh.insert_indices(Indices::U32(chunk.indices.clone()));
-        let settings = prepared.geometry.heights;
-        let raw_heights: Vec<_> = chunk
-            .positions
-            .iter()
-            .map(|p| settings.inverse_meters(f64::from(p[1]) * 1000.))
-            .collect();
-        let gradients = chunk
-            .normals
-            .iter()
-            .zip(&raw_heights)
-            .map(|(n, h)| {
-                let derivative = settings.derivative(*h) as f32;
-                [-n[0] / n[1] / derivative, n[2] / n[1] / derivative]
-            })
-            .collect();
         commands.spawn((
             MapEntity,
             DisplayMesh {
-                heights: raw_heights,
-                gradients,
+                vertices: chunk.display.clone(),
             },
             TerrainChunk {
                 triangle_cells: chunk.triangle_cells.clone(),
@@ -161,7 +160,84 @@ pub(super) fn install(
             Transform::default(),
         ));
     }
+    let outline_water = prepared
+        .geometry
+        .water_chunks
+        .iter()
+        .flat_map(|c| {
+            c.boundaries
+                .iter()
+                .map(|(k, v)| (*k, v.display.samples[0].height))
+        })
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, ids) in prepared.document.chunk_ids() {
+        let mut segments = Vec::new();
+        for id in ids {
+            let outline = &prepared.geometry.outlines[id];
+            for j in 0..outline.len() {
+                let a = outline[j];
+                let b = outline[(j + 1) % outline.len()];
+                let edge = if a < b { [a, b] } else { [b, a] };
+                if seen.insert(edge) {
+                    segments.push(edge);
+                }
+            }
+        }
+        let grid = grid_asset(
+            &segments,
+            &prepared.geometry.corners,
+            &outline_water,
+            prepared.geometry.heights,
+            prepared.document.settings.spacing_km as f32 * 0.008,
+        );
+        let handle = gizmo_assets.add(grid);
+        commands.spawn((
+            MapEntity,
+            GridLines {
+                handle: handle.clone(),
+                segments,
+            },
+            Gizmo {
+                handle: Handle::default(),
+                depth_bias: -0.0001,
+                ..default()
+            },
+        ));
+    }
     for model in &prepared.models {
+        let single = match model.kind {
+            ModelKind::Rock => Some((&assets.rock, &assets.stone, Vec3::new(1., 0.65, 0.8), 0.325)),
+            ModelKind::Shrub => Some((
+                &assets.shrub,
+                &assets.foliage[model.variant],
+                Vec3::new(1., 0.75, 1.),
+                0.375,
+            )),
+            ModelKind::Grass => Some((
+                &assets.grass,
+                &assets.foliage[model.variant],
+                Vec3::new(1., 1., 1.),
+                0.15,
+            )),
+            _ => None,
+        };
+        if let Some((mesh, material, scale, height)) = single {
+            commands.spawn((
+                MapEntity,
+                EnvironmentModel {
+                    cell_id: model.cell_id,
+                    point_m: model.point_m,
+                    offset: height * model.scale,
+                },
+                Mesh3d(mesh.clone()),
+                MeshMaterial3d(material.clone()),
+                Transform::from_translation(model.position + Vec3::Y * height * model.scale)
+                    .with_scale(scale * model.scale)
+                    .with_rotation(Quat::from_rotation_y(model.yaw)),
+            ));
+            continue;
+        }
         let (parts, mesh, material, upper_mesh, upper_material) = match model.kind {
             ModelKind::Tree => (
                 [0.35, 1.15],
@@ -177,6 +253,7 @@ pub(super) fn install(
                 &assets.roof,
                 &assets.roof_material,
             ),
+            _ => unreachable!(),
         };
         for (height, mesh, material) in [
             (parts[0], mesh, material),
@@ -185,10 +262,8 @@ pub(super) fn install(
             commands.spawn((
                 MapEntity,
                 EnvironmentModel {
-                    raw_ground: prepared
-                        .geometry
-                        .heights
-                        .inverse_meters(f64::from(model.position.y) * 1000.),
+                    cell_id: model.cell_id,
+                    point_m: model.point_m,
                     offset: height * model.scale,
                 },
                 Mesh3d(mesh.clone()),
@@ -203,6 +278,7 @@ pub(super) fn install(
 
 /// A display-only change updates existing assets immediately. No source access,
 /// channel regeneration or triangulation is needed while dragging a slider.
+#[allow(clippy::too_many_arguments)] // Bevy system parameters.
 pub fn height_preview(
     mut ui: ResMut<UiState>,
     mut view: ResMut<MapView>,
@@ -210,6 +286,8 @@ pub fn height_preview(
     chunks: Query<(&Mesh3d, &DisplayMesh)>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut models: Query<(&mut Transform, &EnvironmentModel)>,
+    grids: Query<&GridLines>,
+    mut gizmo_assets: ResMut<Assets<GizmoAsset>>,
 ) {
     if jobs.active.is_some() {
         return;
@@ -228,37 +306,43 @@ pub fn height_preview(
                     if let Some(VertexAttributeValues::Float32x3(positions)) =
                         mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
                     {
-                        for (p, h) in positions.iter_mut().zip(&display.heights) {
-                            p[1] = (settings.meters(*h) / 1000.) as f32;
+                        for (p, h) in positions.iter_mut().zip(&display.vertices) {
+                            p[1] = (h.meters(settings) / 1000.) as f32;
                         }
                     }
                     if let Some(VertexAttributeValues::Float32x3(normals)) =
                         mesh.attribute_mut(Mesh::ATTRIBUTE_NORMAL)
                     {
-                        for ((n, h), g) in normals
-                            .iter_mut()
-                            .zip(&display.heights)
-                            .zip(&display.gradients)
-                        {
-                            let derivative = settings.derivative(*h) as f32;
-                            *n = Vec3::new(-g[0] * derivative, 1., g[1] * derivative)
-                                .normalize()
-                                .to_array();
+                        for (n, vertex) in normals.iter_mut().zip(&display.vertices) {
+                            *n = vertex.normal(settings);
                         }
                     }
                 }
             }
-            for (mut transform, model) in &mut models {
-                transform.translation.y =
-                    (settings.meters(model.raw_ground) / 1000.) as f32 + model.offset;
-            }
             for corner in view.corners.values_mut() {
-                corner.position[1] = (settings.meters(corner.raw_height) / 1000.) as f32;
-                let d = settings.derivative(corner.raw_height) as f32;
-                corner.normal =
-                    Vec3::new(-corner.raw_gradient[0] * d, 1., corner.raw_gradient[1] * d)
-                        .normalize()
-                        .to_array();
+                corner.position[1] = (corner.display.meters(settings) / 1000.) as f32;
+                corner.normal = corner.display.normal(settings);
+            }
+            for grid in &grids {
+                if let Some(mut asset) = gizmo_assets.get_mut(&grid.handle) {
+                    *asset = grid_asset(
+                        &grid.segments,
+                        &view.corners,
+                        &view.outline_water,
+                        settings,
+                        document.settings.spacing_km as f32 * 0.008,
+                    );
+                }
+            }
+            for (mut transform, model) in &mut models {
+                if let Some(height) = terrain::surface_height(
+                    &document.cells[model.cell_id as usize],
+                    model.point_m,
+                    &view.triangles,
+                    &view.corners,
+                ) {
+                    transform.translation.y = height + model.offset;
+                }
             }
             let mut changed = (*document).clone();
             changed.heights = settings;
@@ -298,6 +382,17 @@ pub fn models_visibility(
     }
 }
 
+#[derive(PartialEq)]
+struct PickKey {
+    ray: Ray3d,
+    revision: u64,
+    heights: HeightSettings,
+}
+pub struct CachedPick {
+    key: PickKey,
+    cell: Option<u32>,
+}
+
 #[allow(clippy::too_many_arguments)] // Bevy system parameters.
 pub fn pick(
     mut ui: ResMut<UiState>,
@@ -308,6 +403,7 @@ pub fn pick(
     chunks: Query<&TerrainChunk>,
     mut raycast: MeshRayCast,
     mut view: ResMut<MapView>,
+    mut cached: Local<Option<CachedPick>>,
 ) {
     view.hovered = None;
     if ui.pointer_blocked || view.document.is_none() {
@@ -325,59 +421,110 @@ pub fn pick(
     let Ok(ray) = camera.viewport_to_world(transform, cursor) else {
         return;
     };
-    let filter = |entity| chunks.contains(entity);
-    if let Some((entity, hit)) = raycast
-        .cast_ray(ray, &MeshRayCastSettings::default().with_filter(&filter))
-        .first()
-    {
-        let id = hit
-            .triangle_index
-            .and_then(|t| chunks.get(*entity).ok()?.triangle_cells.get(t).copied());
-        view.hovered = id;
-        if buttons.just_pressed(MouseButton::Left) && !keys.pressed(KeyCode::ShiftLeft) {
-            view.selected = id;
-            if ui.city_paint && id.is_some() {
-                ui.edit_requested = Some(true);
-            }
+    let key = PickKey {
+        ray,
+        revision: view.revision,
+        heights: view.heights,
+    };
+    let id = if let Some(previous) = cached.as_ref().filter(|p| p.key == key) {
+        previous.cell
+    } else {
+        let filter = |entity| chunks.contains(entity);
+        let id = raycast
+            .cast_ray(ray, &MeshRayCastSettings::default().with_filter(&filter))
+            .first()
+            .and_then(|(entity, hit)| {
+                hit.triangle_index
+                    .and_then(|t| chunks.get(*entity).ok()?.triangle_cells.get(t).copied())
+            });
+        *cached = Some(CachedPick { key, cell: id });
+        id
+    };
+    view.hovered = id;
+    if buttons.just_pressed(MouseButton::Left) && !keys.pressed(KeyCode::ShiftLeft) {
+        view.selected = id;
+        if ui.city_paint && id.is_some() {
+            ui.edit_requested = Some(true);
         }
     }
 }
 
-pub fn overlay(view: Res<MapView>, ui: Res<UiState>, mut gizmos: Gizmos) {
+fn outline_position(
+    key: terrain::VertexKey,
+    corners: &BTreeMap<terrain::VertexKey, terrain::Corner>,
+    water: &BTreeMap<terrain::VertexKey, f64>,
+    heights: HeightSettings,
+    lift: f32,
+) -> Vec3 {
+    let mut p = Vec3::from_array(corners[&key].position);
+    if let Some(h) = water.get(&key) {
+        p.y = p.y.max((heights.meters(*h) / 1000.) as f32);
+    }
+    p + Vec3::Y * lift
+}
+fn grid_asset(
+    segments: &[[terrain::VertexKey; 2]],
+    corners: &BTreeMap<terrain::VertexKey, terrain::Corner>,
+    water: &BTreeMap<terrain::VertexKey, f64>,
+    heights: HeightSettings,
+    lift: f32,
+) -> GizmoAsset {
+    let mut asset = GizmoAsset::default();
+    for [a, b] in segments {
+        asset.line(
+            outline_position(*a, corners, water, heights, lift),
+            outline_position(*b, corners, water, heights, lift),
+            Color::srgba(0.12, 0.17, 0.12, 0.38),
+        );
+    }
+    asset
+}
+pub fn grid_visibility(
+    ui: Res<UiState>,
+    view: Res<MapView>,
+    orbit: Res<OrbitCamera>,
+    mut grids: Query<(&GridLines, &mut Gizmo)>,
+) {
+    // Avoid drawing subpixel lines across huge maps. The cached assets remain
+    // available immediately when zoomed in or toggled back on.
+    let show = ui.grid
+        && view
+            .document
+            .as_ref()
+            .is_some_and(|d| orbit.distance / (d.settings.spacing_km as f32) < 400.);
+    for (grid, mut gizmo) in &mut grids {
+        let desired = if show {
+            grid.handle.clone()
+        } else {
+            Handle::default()
+        };
+        if gizmo.handle != desired {
+            gizmo.handle = desired;
+        }
+    }
+}
+pub fn overlay(view: Res<MapView>, mut gizmos: Gizmos) {
     let Some(document) = &view.document else {
         return;
     };
-    let spacing = document.settings.spacing_km as f32;
-    let lift = Vec3::Y * (spacing * 0.008);
-    let draw_cell = |id: u32, color: Color, gizmos: &mut Gizmos| {
-        if let Some(cell) = document.cells.get(id as usize) {
-            let points: Vec<_> = (0..=6 * terrain::SUBDIVISIONS)
-                .filter_map(|i| {
-                    let side = (i / terrain::SUBDIVISIONS) as usize % 6;
-                    let t = (i % terrain::SUBDIVISIONS) as f64 / f64::from(terrain::SUBDIVISIONS);
-                    let a = vertex_position(corner_key(cell.hex, side), f64::from(spacing) * 1000.);
-                    let b = vertex_position(
-                        corner_key(cell.hex, (side + 1) % 6),
-                        f64::from(spacing) * 1000.,
-                    );
-                    let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-                    let height = terrain::surface_height(cell, p, &view.triangles, &view.corners)?;
-                    Some(Vec3::new((p[0] / 1000.) as f32, height, (-p[1] / 1000.) as f32) + lift)
-                })
-                .collect();
-            gizmos.linestrip(points, color);
+    let lift = document.settings.spacing_km as f32 * 0.008;
+    let draw = |id: u32, color: Color, gizmos: &mut Gizmos| {
+        if let Some(keys) = view.outlines.get(id as usize)
+            && let Some(first) = keys.first()
+        {
+            gizmos.linestrip(
+                keys.iter().chain(std::iter::once(first)).map(|key| {
+                    outline_position(*key, &view.corners, &view.outline_water, view.heights, lift)
+                }),
+                color,
+            );
         }
     };
-    if ui.grid && document.cells.len() <= 12_000 {
-        for cell in &document.cells {
-            draw_cell(cell.id, Color::srgba(0.12, 0.17, 0.12, 0.38), &mut gizmos);
-        }
-    }
     if let Some(id) = view.hovered {
-        draw_cell(id, Color::srgb(0.62, 0.82, 0.93), &mut gizmos);
+        draw(id, Color::srgb(0.62, 0.82, 0.93), &mut gizmos);
     }
     if let Some(id) = view.selected {
-        draw_cell(id, Color::srgb(1., 0.77, 0.27), &mut gizmos);
+        draw(id, Color::srgb(1., 0.77, 0.27), &mut gizmos);
     }
 }
 
@@ -499,27 +646,97 @@ pub fn smoke_validation(
 mod tests {
     use super::*;
     #[test]
+    fn outline_toggles_reuse_cached_assets_without_rebuilding_lines() {
+        let document = Arc::new(terrain::fixture().unwrap());
+        let mut assets = Assets::<GizmoAsset>::default();
+        let mut lines = GizmoAsset::default();
+        lines.line(Vec3::ZERO, Vec3::X, Color::WHITE);
+        let handle = assets.add(lines);
+        let mut app = App::new();
+        app.insert_resource(assets)
+            .insert_resource(UiState::default())
+            .insert_resource(MapView {
+                document: Some(document),
+                ..default()
+            })
+            .insert_resource(OrbitCamera {
+                distance: 100.,
+                ..default()
+            })
+            .add_systems(Update, grid_visibility);
+        let entity = app
+            .world_mut()
+            .spawn((
+                GridLines {
+                    handle: handle.clone(),
+                    segments: vec![],
+                },
+                Gizmo::default(),
+            ))
+            .id();
+        for frame in 0..120 {
+            let on = frame % 2 == 0;
+            app.world_mut().resource_mut::<UiState>().grid = on;
+            app.update();
+            let active = &app.world().get::<Gizmo>(entity).unwrap().handle;
+            assert_eq!(
+                *active,
+                if on {
+                    handle.clone()
+                } else {
+                    Handle::default()
+                }
+            );
+            assert_eq!(app.world().resource::<Assets<GizmoAsset>>().len(), 1);
+        }
+        app.world_mut().resource_mut::<OrbitCamera>().distance = 1000.;
+        app.world_mut().resource_mut::<UiState>().grid = true;
+        app.update();
+        assert_eq!(
+            app.world().get::<Gizmo>(entity).unwrap().handle,
+            Handle::default()
+        );
+    }
+    #[test]
     fn live_height_preview_keeps_water_models_and_document_aligned() {
         let document = Arc::new(terrain::fixture().unwrap());
         let original = document.height_field.elevations_m.clone();
+        let geometry = terrain::build(
+            &document,
+            document.heights,
+            &crate::jobs::JobContext::default(),
+        )
+        .unwrap();
         let settings = HeightSettings {
-            scale: 0.7,
-            compression_m: 300.,
+            scale: 1.2,
+            compression_m: 1200.,
+            hill_boost: 0.7,
         };
         let mut meshes = Assets::<Mesh>::default();
+        let chunk = &geometry.chunks[0];
         let mut mesh = Mesh::new(
             PrimitiveTopology::TriangleList,
             RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
         );
-        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0., 0., 0.], [1., 0., 1.]]);
-        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0., 1., 0.]; 2]);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, chunk.positions.clone());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, chunk.normals.clone());
         let handle = meshes.add(mesh);
+        let cell = document
+            .cells
+            .iter()
+            .find(|c| c.hex == hexx::Hex::ZERO)
+            .unwrap();
+        let cell_id = cell.id;
+        let point = cell.center_m;
         let mut app = App::new();
         app.insert_resource(meshes)
+            .insert_resource(Assets::<GizmoAsset>::default())
             .insert_resource(Jobs::default())
             .insert_resource(MapView {
                 document: Some(document),
                 heights: HeightSettings::default(),
+                corners: geometry.corners,
+                triangles: geometry.triangles,
                 ..default()
             })
             .insert_resource(UiState {
@@ -532,8 +749,7 @@ mod tests {
         app.world_mut().spawn((
             Mesh3d(handle.clone()),
             DisplayMesh {
-                heights: vec![2000., 20.],
-                gradients: vec![[0.3, 0.1], [0.02, 0.]],
+                vertices: chunk.display.clone(),
             },
         ));
         let model = app
@@ -541,7 +757,8 @@ mod tests {
             .spawn((
                 Transform::default(),
                 EnvironmentModel {
-                    raw_ground: 2000.,
+                    cell_id,
+                    point_m: point,
                     offset: 0.1,
                 },
             ))
@@ -555,19 +772,22 @@ mod tests {
             .unwrap()
             .as_float3()
             .unwrap();
-        assert!((positions[0][1] - settings.meters(2000.) as f32 / 1000.).abs() < 1e-6);
-        assert!((positions[1][1] - settings.meters(20.) as f32 / 1000.).abs() < 1e-6);
+        assert!((positions[0][1] - chunk.display[0].meters(settings) as f32 / 1000.).abs() < 1e-6);
+        let view = app.world().resource::<MapView>();
+        let doc = view.document.as_ref().unwrap();
+        let height = terrain::surface_height(
+            &doc.cells[cell_id as usize],
+            point,
+            &view.triangles,
+            &view.corners,
+        )
+        .unwrap();
         assert!(
-            (app.world().get::<Transform>(model).unwrap().translation.y - positions[0][1] - 0.1)
-                .abs()
+            (app.world().get::<Transform>(model).unwrap().translation.y - height - 0.1).abs()
                 < 1e-6
         );
-        let view = app.world().resource::<MapView>();
-        assert_eq!(view.document.as_ref().unwrap().heights, settings);
-        assert_eq!(
-            view.document.as_ref().unwrap().height_field.elevations_m,
-            original
-        );
+        assert_eq!(doc.heights, settings);
+        assert_eq!(doc.height_field.elevations_m, original);
         assert_eq!(app.world().resource::<UiState>().undo.len(), 1);
     }
 }

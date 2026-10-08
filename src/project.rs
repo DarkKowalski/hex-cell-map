@@ -49,6 +49,7 @@ mod tests {
         d.heights = HeightSettings {
             scale: 0.7,
             compression_m: 350.,
+            hill_boost: 0.6,
         };
         d.cells[0].urban = Some(UrbanTerrain {
             population: 12345,

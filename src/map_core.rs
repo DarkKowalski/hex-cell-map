@@ -249,12 +249,18 @@ pub struct UrbanTerrain {
 pub struct HeightSettings {
     pub scale: f32,
     pub compression_m: f64,
+    #[serde(default = "default_hill_boost")]
+    pub hill_boost: f32,
+}
+fn default_hill_boost() -> f32 {
+    0.6
 }
 impl Default for HeightSettings {
     fn default() -> Self {
         Self {
-            scale: 1.,
-            compression_m: 500.,
+            scale: 1.4,
+            compression_m: 1500.,
+            hill_boost: default_hill_boost(),
         }
     }
 }
@@ -264,24 +270,39 @@ impl HeightSettings {
             self.scale.is_finite()
                 && (0.2..=2.).contains(&self.scale)
                 && self.compression_m.is_finite()
-                && (100. ..=5000.).contains(&self.compression_m),
+                && (100. ..=5000.).contains(&self.compression_m)
+                && self.hill_boost.is_finite()
+                && (0. ..=1.5).contains(&self.hill_boost),
             "Invalid display height settings"
         );
         Ok(())
     }
     pub fn inverse_meters(self, height: f64) -> f64 {
+        let value = height.abs() / f64::from(self.scale);
         height.signum()
-            * self.compression_m
-            * (height.abs() / (f64::from(self.scale) * self.compression_m)).exp_m1()
+            * if value <= self.compression_m {
+                value
+            } else {
+                self.compression_m * ((value - self.compression_m) / self.compression_m).exp()
+            }
     }
     pub fn derivative(self, elevation: f64) -> f64 {
-        f64::from(self.scale) / (1. + elevation.abs() / self.compression_m)
+        f64::from(self.scale)
+            * if elevation.abs() <= self.compression_m {
+                1.
+            } else {
+                self.compression_m / elevation.abs()
+            }
     }
     pub fn meters(self, elevation: f64) -> f64 {
+        let value = elevation.abs();
         elevation.signum()
             * f64::from(self.scale)
-            * self.compression_m
-            * (elevation.abs() / self.compression_m).ln_1p()
+            * if value <= self.compression_m {
+                value
+            } else {
+                self.compression_m + self.compression_m * (value / self.compression_m).ln()
+            }
     }
 }
 

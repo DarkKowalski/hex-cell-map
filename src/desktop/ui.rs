@@ -112,10 +112,11 @@ pub fn show(
             ui.separator();
             ui.strong("View");
             ui.horizontal(|ui| { ui.checkbox(&mut state.models, "Trees & cities"); ui.checkbox(&mut state.grid, "Hex outlines"); });
-            if state.grid && view.document.as_ref().is_some_and(|d| d.cells.len() > 12_000) { ui.small("Full outlines are available for maps up to 12,000 hexes."); }
+            if state.grid && view.document.as_ref().is_some_and(|d| orbit.distance / d.settings.spacing_km as f32 > 400.) { ui.small("Zoom in to see hex outlines."); }
             if ui.add_enabled(!active, egui::Slider::new(&mut state.heights.scale, 0.2..=2.).text("Height scale")).changed() { state.rebuild_requested = true; }
-            if ui.add_enabled(!active, egui::Slider::new(&mut state.heights.compression_m, 100. ..=5000.).logarithmic(true).text("Compression (m)")).changed() { state.rebuild_requested=true; }
-            ui.small("Lower compression values flatten high mountains more. GIS elevations remain unchanged.");
+            if ui.add_enabled(!active, egui::Slider::new(&mut state.heights.compression_m, 100. ..=5000.).logarithmic(true).text("Compress above (m)")).changed() { state.rebuild_requested=true; }
+            if ui.add_enabled(!active,egui::Slider::new(&mut state.heights.hill_boost,0. ..=1.5).text("Local relief boost")).changed(){state.rebuild_requested=true;}
+            ui.small("Ordinary relief keeps its height; extremes soften above the threshold. Local detail stays continuous, with level water and unchanged GIS data.");
             if ui.add_enabled(view.document.is_some(), egui::Button::new("Fit map")).clicked() && let Some(document) = &view.document { orbit.fit(document, view.heights); }
             ui.small("Middle drag / Shift + left drag: pan\nRight drag / Q, E: rotate\nWheel / trackpad: zoom · WASD: pan\nLeft click: inspect a hex");
             ui.separator();

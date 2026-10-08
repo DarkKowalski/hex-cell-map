@@ -11,6 +11,7 @@ fn main() -> Result<()> {
     let mut output = None;
     let mut repeat = false;
     let mut audit = false;
+    let mut audit_terrain = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -56,6 +57,7 @@ fn main() -> Result<()> {
             "--output" => output = Some(PathBuf::from(args.next().context("Missing output path")?)),
             "--repeat" => repeat = true,
             "--audit-raster" => audit = true,
+            "--audit-terrain" => audit_terrain = true,
             "--check-environment" => {
                 check_environment()?;
                 return Ok(());
@@ -84,6 +86,74 @@ fn main() -> Result<()> {
         println!(
             "{} raster windows match independent GDAL RasterIO within 0.001",
             hex_cell_map::gis::raster::audit_references(&cache, &document.sources, &context)?
+        );
+    }
+    if audit_terrain {
+        let geometry = hex_cell_map::terrain::build(&document, document.heights, &context)?;
+        hex_cell_map::terrain::validate_topology(&geometry)?;
+        let mut shared = std::collections::BTreeMap::new();
+        let mut seams = 0;
+        let mut triangles = 0;
+        for chunk in &geometry.chunks {
+            triangles += chunk.triangle_cells.len();
+            ensure!(
+                chunk.positions.iter().flatten().all(|v| v.is_finite())
+                    && chunk.normals.iter().flatten().all(|v| v.is_finite()),
+                "Invalid terrain geometry"
+            );
+            for (key, vertex) in &chunk.boundaries {
+                if let Some(previous) = shared.insert(*key, *vertex) {
+                    ensure!(
+                        previous.position == vertex.position && previous.normal == vertex.normal,
+                        "Chunk seam mismatch"
+                    );
+                    seams += 1;
+                }
+            }
+        }
+        let min_up = geometry
+            .water_chunks
+            .iter()
+            .flat_map(|c| &c.normals)
+            .map(|n| n[1])
+            .fold(1., f32::min);
+        if min_up <= 0.97 {
+            let (chunk, i) = geometry
+                .water_chunks
+                .iter()
+                .flat_map(|c| (0..c.normals.len()).map(move |i| (c, i)))
+                .min_by(|(a, i), (b, j)| a.normals[*i][1].total_cmp(&b.normals[*j][1]))
+                .unwrap();
+            let p = chunk.positions[i];
+            let p = [f64::from(p[0]) * 1000., -f64::from(p[2]) * 1000.];
+            eprintln!("Steep water sample at {p:?}: {:?}", chunk.display[i]);
+            for c in geometry.hydrology.channels_near(p) {
+                let (d, h) = hex_cell_map::hydrology::Hydrology::closest(c, p);
+                if d < c.half_width * 2. {
+                    eprintln!("Nearby channel: distance {d}, level {h}, {c:?}");
+                }
+            }
+        }
+        ensure!(
+            geometry.water_chunks.iter().all(|c| c
+                .positions
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite())
+                && c.normals.iter().flatten().all(|v| v.is_finite())),
+            "Invalid water geometry"
+        );
+        ensure!(
+            min_up > 0.97,
+            "Water surface is too steep: minimum up-normal {min_up}"
+        );
+        println!(
+            "Terrain audit: {triangles} land triangles, {seams} matching seam samples, {} water triangles, minimum water up-normal {min_up:.5}",
+            geometry
+                .water_chunks
+                .iter()
+                .map(|c| c.triangle_cells.len())
+                .sum::<usize>()
         );
     }
     let digest = cell_digest(&document)?;

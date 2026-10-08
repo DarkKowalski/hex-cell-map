@@ -1,3 +1,4 @@
+pub mod elevation;
 pub mod generation;
 pub mod gis;
 pub mod hydrology;
