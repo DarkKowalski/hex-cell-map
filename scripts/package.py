@@ -90,6 +90,7 @@ def main():
             shutil.copy2(file, proj / file.name)
     for name in ["NOTICE.md", "README.md"]:
         shutil.copy2(ROOT / name, data_dir / name)
+    shutil.copytree(ROOT / "docs", data_dir / "docs")
     dependency_notices(data_dir)
     if apple:
         with (package / "Contents/Info.plist").open("wb") as stream:

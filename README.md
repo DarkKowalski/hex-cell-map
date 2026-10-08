@@ -1,6 +1,6 @@
 # Hex Cell Map
 
-Native Rust + Bevy GIS hex-map generator for Windows x64 and macOS Apple Silicon. Development follows [the roadmap](docs/roadmap.md). The desktop view uses continuous DEM terrain, separate river channels and source-mask water bodies, blended GIS colors, urban hexes and configurable nonlinear height compression.
+Native Rust + Bevy GIS hex-map generator for Windows x64 and macOS Apple Silicon. Development follows [the roadmap](docs/roadmap.md). The desktop view uses continuous DEM terrain, merged river channels and source-mask water bodies, blended GIS colors, urban hexes and adaptive height compression that preserves hills and mountain detail.
 
 ## Build and run
 
@@ -13,20 +13,20 @@ cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Select a region in the sidebar and generate its map. Middle drag or Shift + left drag pans, right drag or Q/E rotates, the wheel zooms, and WASD pans. Click to inspect a hex. Display height controls preserve original source elevations. Urban cell controls apply or remove complete cells, adjust population/style and brush radius, and provide undo/redo. River cells retain their river identity; buildings use dry ground. Source settlement records remain available after an urban edit.
+Select a region in the sidebar and generate its map. Middle drag or Shift + left drag pans, right drag or Q/E rotates, the wheel zooms, and WASD pans. Click to inspect a hex. Hex outlines use cached, shared edges; zoom in if the grid would be too small to read. Display height controls provide scale, an extreme-height threshold and local-relief enhancement, with immediate preview and unchanged source elevations. Urban cell controls apply or remove complete cells, adjust population/style and brush radius, and provide undo/redo. River cells retain their river identity; buildings use dry ground. Source settlement records remain available after an urban edit.
 
 The Project panel opens and saves self-contained JSON snapshots to the entered path, including height settings and urban edits. A previous valid snapshot is retained as `.hexmap.bak`. General terrain/elevation brushes, broader project workflow and release performance gates are in later milestones.
 
 ## Real GIS validation
 
 ```sh
-cargo run --locked --bin gis-probe -- --region alps --repeat --audit-raster --output target/validation/alps.json
-cargo run --locked --bin gis-probe -- --region hudson --repeat --audit-raster --output target/validation/hudson.json
-cargo run --locked --bin gis-probe -- --region yangtze --repeat --audit-raster --output target/validation/yangtze.json
+cargo run --locked --bin gis-probe -- --region alps --repeat --audit-raster --audit-terrain --output target/validation/alps.json
+cargo run --locked --bin gis-probe -- --region hudson --repeat --audit-raster --audit-terrain --output target/validation/hudson.json
+cargo run --locked --bin gis-probe -- --region yangtze --repeat --audit-raster --audit-terrain --output target/validation/yangtze.json
 cargo run --locked --bin hex-cell-map -- --preview target/validation/alps.json --smoke --screenshot target/validation/alps.png
 ```
 
-The probe automatically retrieves Copernicus GLO-90, ESA WorldCover 2021, HydroRIVERS and GeoNames. It validates settlement containment, river connectivity, independently decoded raster windows and deterministic source fields/paths/cells. Its JSON can also be opened in the desktop Project panel. Schema 2 retains source land cover and river geometry; older development artifacts must be regenerated from their cached inputs.
+The probe automatically retrieves Copernicus GLO-90, ESA WorldCover 2021, HydroRIVERS and GeoNames. It validates settlement containment, river connectivity, independently decoded raster windows and deterministic source fields/paths/cells. The terrain audit checks complete boundary connectivity, seam positions and normals, finite geometry and water vertex normal orientation. Add `--outlines` to the native smoke command to validate the cached grid. Its JSON can also be opened in the desktop Project panel. Schema 2 retains source land cover and river geometry; older development artifacts must be regenerated from their cached inputs. See [validation results and remaining release gates](docs/validation.md).
 
 Use `--bounds WEST SOUTH EAST NORTH` and `--spacing KM` for other supported regions. Limits are 1–20 km between neighboring hex centers, 1,000 km extent, 100,000 hexes and latitude ±60°, without antimeridian crossings. All boundary hexes intersecting the selection are included. Cell statistics use 13 deterministic samples; a separate projected source field controls terrain and materials. Visible river widths, urban footprints and buildings are symbolic at operational scale.
 

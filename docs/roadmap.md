@@ -2,7 +2,7 @@
 
 Build a PC-native GIS-driven 3D hexagonal map generator and visual editor using Rust and Bevy. Users select a real geographic region, configure hex spacing, automatically generate a map from real GIS data, edit it visually, and reliably save and reload their work.
 
-Implementation covers **M0–M2**, plus the requested river integration, GIS-driven materials, urban-cell editing, nonlinear display heights and persisted settings. Native Windows packaging and clean-machine checks remain acceptance gates. Local commits record working checkpoints. The research baseline is **8 October 2026**.
+Implemented functionality covers **M0–M2**, plus river integration, GIS-driven materials, urban-cell editing, adaptive display heights and persisted settings. [Validation results](validation.md) record the real GIS and macOS rendering checks. Native Windows runtime verification, clean-machine checks and release performance measurements remain acceptance gates. The research baseline is **8 October 2026**.
 
 ## Scope and constraints
 
@@ -29,7 +29,7 @@ Use one Rust application, with ordinary modules and Bevy plugins connecting the 
 | Editor UI | **bevy_egui 0.42.0** | Explicitly supports Bevy 0.19. Use its re-exported `egui` to avoid introducing another UI version. [Compatibility table](https://docs.rs/crate/bevy_egui/latest) |
 | Hex coordinates | **hexx 0.25.0** | Supports Bevy 0.19. Enable only the coordinate, grid, and serialization functionality needed by the editor. Build continuous terrain meshes separately. [Dependencies and features](https://docs.rs/crate/hexx/latest) |
 | GIS | **gdal 0.19.0**, **gdal-src 0.3.0 / GDAL 3.12.1**, bundled **PROJ 9.6.2** | Minimal static build enables GeoTIFF, shapefile, GeoJSON, memory drivers, and HTTPS range reads. Package PROJ data with the executable. Unix TLS uses vendored OpenSSL and bundled Mozilla certificate roots; Windows uses Schannel. [Version support](https://docs.rs/crate/gdal/0.19.0) |
-| Geometry | **geo 0.33.1**, using `geo-types` 0.7 | Polygon containment and line–hex intersections. Compatible with the geometry types used by `gdal`. Keep projection through GDAL rather than adding another PROJ binding. [Manifest](https://docs.rs/crate/geo/latest/source/Cargo.toml) |
+| Geometry | **geo 0.33.1**, `spade 2.15.1`, using `geo-types` 0.7 | Polygon unions, containment, line–hex intersections and local constrained triangulation around channels. Compatible with the geometry types used by `gdal`. Keep projection through GDAL rather than adding another PROJ binding. [Manifest](https://docs.rs/crate/geo/latest/source/Cargo.toml) |
 | Downloads | **ureq 3.x** | Blocking HTTP on a background worker avoids an application-wide async runtime. GDAL handles raster range reads separately. [Documentation](https://docs.rs/ureq/latest/ureq/) |
 | Persistence and utilities | `serde` 1, `serde_json` 1, `tempfile` 3, `zip` 8, `anyhow` 1, `sha2` 0.10, `dirs` 6 | Exact resolved versions are in `Cargo.lock`. Use JSON initially rather than designing a binary format. |
 | File dialogs | **rfd 0.17.2** | Native Windows and macOS dialogs. [Crate documentation](https://docs.rs/crate/rfd/latest) |
@@ -124,17 +124,22 @@ River classification occupies complete cells for editing and selection. Visible 
 
 ### Continuous terrain and environmental models
 
-- Use **32 × 32-cell chunks** and a separate projected source DEM height field. Subdivide terrain within hex ownership boundaries; terrain shape follows the source field rather than cell means.
-- Retain source WorldCover classes at projected samples. Blend vegetation, crop, bare ground, urban, wetland and snow/ice colors, with rock exposure driven by source slope. Add subtle multi-scale procedural tint and grain; procedural variation does not replace GIS classification.
-- Retain HydroRIVERS polylines and downstream metadata. Derive bounded downhill water profiles and locally carved beds/banks. Refine meshes near channels; render water as separate gentle ribbons. Derive lake and coastal shorelines from the source open-water mask.
+- Use **32 × 32-cell chunks** and a separate projected source DEM height field. Subdivide terrain within hex ownership boundaries; terrain shape follows the source field rather than cell means. Use integer coordinates in the normalized hex basis and a shared, ordered edge registry so both owners retain every boundary subdivision.
+- Retain source WorldCover classes at projected samples. Blend vegetation, crop, bare ground, urban, wetland and snow/ice colors, with rock exposure driven by source slope. Use multi-scale triplanar procedural soil, gravel and rock variation, with zoom-dependent normal and roughness detail. Procedural variation does not replace GIS classification.
+- Retain HydroRIVERS polylines and downstream metadata. Derive bounded downhill water profiles and locally carved beds/banks. Refine meshes near channels; union channel, bend and source-mask lake footprints before triangulating a single water surface. Derive lake and coastal shorelines from the source open-water mask.
+- Use level source-mask water interiors and finer shoreline contours. Connect complete water bodies to overlapping river profiles in the conditioning graph, so downstream adjustments update every crossing together. Compute shallow-edge gradients from the combined shoreline, with wet-bank ground coloring and shared water vertices across chunks. Water uses the refined terrain triangulation to keep shoreline shading local.
 - Use globally canonical local-coordinate vertices and consistent normal sampling across chunks. Keep every rendered triangle assigned to its logical hex for selection.
-- Apply the monotone display transform `sign(h) × scale × compression × ln(1 + abs(h)/compression)` to terrain and water together. Default scale is 1 and compression is 500 m. Keep original elevations, edited elevations and display settings separate.
+- Preserve ordinary elevations with a soft compression threshold: below the threshold use `scale × h`; above it use `sign(h) × scale × threshold × (1 + ln(abs(h)/threshold))`. The base curve is continuous, differentiable and monotone, and keeps sea level fixed.
+- Derive a continuous local baseline and relief field from source samples for bounded detail enhancement. Hills receive more detail gain than rugged mountain terrain; the enhancement fades near water. This metadata never replaces or smooths the authoritative DEM. Defaults are scale 1.4, threshold 1,500 m and local relief boost 0.6.
+- Apply the same base curve to river and lake levels. Cache display samples so height controls update meshes, normals, models and picking immediately; save all three settings.
+- Cache deduplicated hex outlines in retained Bevy line assets per chunk. Toggling outlines changes handles; it does not resample or rebuild the map. Update the cache after geometry or display-height changes, and hide subpixel outlines at very distant zoom.
+- Reuse the last terrain-picking result while its world ray, map revision and display-height settings are unchanged. Camera movement, pointer movement, viewport changes and edits invalidate the result.
 - Represent urban terrain at cell level. Retain all original settlement records in the containing hex, derive initial population from their sum, and generate symbolic building clusters and streets. River cells retain their hydrological identity; skip buildings on visible water.
 - Generate CPU mesh data on one cancellable worker and install complete, current revisions on the main thread. Revision tags prevent stale jobs from replacing newer views.
-- Reuse mesh/material handles for environmental models. Start with bounded tree density and distance hiding; profile before adding custom instancing or adaptive LOD.
+- Reuse mesh/material handles for environmental models. Start with bounded tree, grass, shrub and rock decoration density and distance hiding; profile before adding custom instancing or adaptive LOD.
 - Self-contained snapshots include source fields, river paths, cells, display settings and provenance. General terrain tools, broader project workflow and performance gates follow in M3–M6.
 
-HydroRIVERS is derived from approximately 500 m source hydrography; its paths can disagree with a finer DEM. Local bed conditioning preserves path coordinates while adapting the rendered terrain around them. This is a visual channel representation, with discharge-informed symbolic width, rather than a hydraulic simulation. [HydroRIVERS technical documentation](https://data.hydrosheds.org/file/technical-documentation/HydroRIVERS_TechDoc_v10.pdf)
+HydroRIVERS is derived from approximately 500 m source hydrography; its paths can disagree with a finer DEM. Local bed conditioning preserves path coordinates while adapting the rendered terrain around them. This is a visual channel representation, with discharge-informed symbolic width and source-knot interpolation bounded to 8% of hex spacing, rather than a hydraulic simulation. [HydroRIVERS technical documentation](https://data.hydrosheds.org/file/technical-documentation/HydroRIVERS_TechDoc_v10.pdf)
 
 ## Required MVP and deferred features
 
@@ -208,15 +213,16 @@ Add chunk meshes, shared boundary calculations, smooth shading, material blendin
 
 **Acceptance criteria:**
 
-- Adjacent chunks have matching boundary positions and normals, including after a boundary elevation change.
+- Adjacent cells and chunks have matching edge connectivity, positions and normals, including after a boundary elevation change. Validate the complete edge sequence, including locally inserted river/bank vertices.
 - Plains, forests, mountains, rivers, and cities remain distinguishable at useful zoom levels.
-- River classifications occupy dedicated cells; visible channels follow source paths through cell interiors without coating slopes or showing hex-shaped water boundaries.
-- Display compression preserves elevation order and aligns terrain, water, models and picking. Original GIS elevations are unchanged.
+- River classifications occupy dedicated cells; visible channels follow source paths through cell interiors without coating slopes or showing hex-shaped water boundaries. Bends, confluences and lake crossings have single water coverage and no internal shoreline stripes.
+- The base compression curve preserves elevation order, ordinary relief survives at altitude, bounded local enhancement preserves recognizable ridges, and terrain/water/models/picking remain aligned. Original GIS elevations are unchanged.
 - Urban cells have ground coverage and population-scaled building clusters; river conflicts retain hydrological identity.
 - Source-based material blending distinguishes bare rock, vegetation, cropland, urban ground and snow/ice.
 - Panning, 360° yaw rotation, and smooth bounded zoom work with mouse and trackpad.
 - Terrain picking selects the correct cell on slopes and near chunk boundaries.
 - UI interaction does not move the camera or select terrain.
+- Repeated outline toggles reuse cached assets, preserve responsiveness, and pass native smoke rendering with outlines enabled.
 
 ### M3 — Make projects portable and reliable
 
