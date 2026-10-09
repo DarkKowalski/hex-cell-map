@@ -1,5 +1,26 @@
 name: Native checks
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      profile:
+        type: string
+        default: debug
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 2
+  MACOSX_DEPLOYMENT_TARGET: '13.0'
+  PYTHONUTF8: '1'
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   native:
@@ -8,10 +29,16 @@ jobs:
       matrix:
         os: [macos-14, windows-2022]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      PACKAGE_PROFILE: ${{ inputs.profile || 'debug' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           lfs: true
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.0
@@ -28,12 +55,35 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install cmake
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.PACKAGE_PROFILE }}
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as stream:
+              version = tomllib.load(stream)['package']['version']
+          assert os.environ['GITHUB_REF_NAME'] == f'v{version}', 'Tag must match Cargo.toml version'
+          PY
       - run: cargo fmt --check
-      - run: cargo test --locked --all-targets
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo build --locked --bins
-      - run: python scripts/package.py
-      - uses: actions/upload-artifact@v4
+      - name: Test native targets
+        run: cargo test --locked --all-targets ${{ inputs.profile == 'release' && '--release' || '' }}
+      - name: Lint native targets
+        run: cargo clippy --locked --all-targets ${{ inputs.profile == 'release' && '--release' || '' }} -- -D warnings
+      - name: Build applications
+        run: cargo build --locked --bins ${{ inputs.profile == 'release' && '--release' || '' }}
+      - name: Bundle and test extracted packages
+        run: |
+          tag_args=()
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag_args=(--tag "$GITHUB_REF_NAME")
+          fi
+          python scripts/package.py --profile "$PACKAGE_PROFILE" --archive "${tag_args[@]}"
+      - uses: actions/upload-artifact@v7
         with:
           name: native-${{ runner.os }}
-          path: dist/
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error

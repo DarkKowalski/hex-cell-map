@@ -41,10 +41,17 @@ Caches use the platform cache directory under `hex-cell-map`. Set `HEX_MAP_CACHE
 
 Raster acquisition, GIS cell and surface sampling, water footprint unions and terrain chunk construction use a shared Rayon worker pool. It automatically uses the available CPU threads, with raster reads limited to four concurrent tiles. Set `RAYON_NUM_THREADS` before launching either binary to limit CPU use; `RAYON_NUM_THREADS=1` provides a serial comparison. The probe reports GIS generation and terrain build times separately when run with `--audit-terrain`. Results retain deterministic tile/cell/chunk order and matching terrain seams across thread counts.
 
-## Development packaging
+## Native packages and releases
+
+Download Windows x64 and macOS Apple Silicon ZIPs from [GitHub Releases](https://github.com/DarkKowalski/hex-cell-map/releases). Extract the Windows package and launch `hex-cell-map.exe`, or extract the macOS package and move `Hex Cell Map.app` to Applications. Each ZIP includes both binaries, art assets, projection data and notices, with a separate SHA-256 checksum file.
+
+CI tests both native platforms and verifies the extracted packages. Pushing a `v*` tag matching the version in `Cargo.toml` builds release binaries and uploads both packages to a GitHub release after all checks pass. [Release notes](docs/releases/v0.1.0.md) describe the first release and its validation scope.
+
+To build the same archive locally:
 
 ```sh
-python3 scripts/package.py
+cargo build --locked --release --bins
+python3 scripts/package.py --profile release --archive --tag v0.1.0
 ```
 
-The script verifies and bundles the art assets alongside built binaries, projection data, notices and platform runtime requirements into `dist/`. Art loads offline from the package. The macOS package is ad-hoc signed for development; release signing/notarization and Windows runtime verification remain release gates. See [data and dependency notices](NOTICE.md) before distributing packages or derived map data.
+Packaging requires Python 3.11 or later. The script verifies assets, creates a versioned ZIP under `dist/`, and tests its extracted executables outside the build directory with projection overrides removed. Art loads offline from the package. The macOS package is ad-hoc signed; release signing/notarization and Windows interactive GPU validation remain release gates. See [data and dependency notices](NOTICE.md) before distributing packages or derived map data. Use `python3 scripts/package.py --archive` for a package of existing debug binaries.

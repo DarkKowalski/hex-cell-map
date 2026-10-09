@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  packages:
+    uses: ./.github/workflows/native.yml
+    with:
+      profile: release
+
+  publish:
+    needs: packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify both platform archives and checksums
+        working-directory: release-assets
+        run: |
+          test -f "hex-cell-map-${RELEASE_TAG}-windows-x64.zip"
+          test -f "hex-cell-map-${RELEASE_TAG}-macos-arm64.zip"
+          sha256sum --check "hex-cell-map-${RELEASE_TAG}-windows-x64.zip.sha256"
+          sha256sum --check "hex-cell-map-${RELEASE_TAG}-macos-arm64.zip.sha256"
+      - name: Upload and publish GitHub release
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            notes_args=(--generate-notes)
+            if [[ -f "docs/releases/${RELEASE_TAG}.md" ]]; then
+              notes_args=(--notes-file "docs/releases/${RELEASE_TAG}.md")
+            fi
+            gh release create "$RELEASE_TAG" release-assets/* --verify-tag --draft \
+              --title "Hex Cell Map ${RELEASE_TAG}" "${notes_args[@]}"
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest
