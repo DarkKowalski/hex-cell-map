@@ -135,7 +135,7 @@ River classification occupies complete cells for editing and selection. Visible 
 - Cache deduplicated hex outlines in retained Bevy line assets per chunk. Toggling outlines changes handles; it does not resample or rebuild the map. Update the cache after geometry or display-height changes, and hide subpixel outlines at very distant zoom.
 - Reuse the last terrain-picking result while its world ray, map revision and display-height settings are unchanged. Camera movement, pointer movement, viewport changes and edits invalidate the result.
 - Represent urban terrain at cell level. Retain all original settlement records in the containing hex, derive initial population from their sum, and generate symbolic building clusters and streets. River cells retain their hydrological identity; skip buildings on visible water.
-- Generate CPU mesh data on one cancellable worker and install complete, current revisions on the main thread. Revision tags prevent stale jobs from replacing newer views.
+- Generate CPU mesh data in a cancellable background job using a shared worker pool and install complete, current revisions on the main thread. Revision tags prevent stale jobs from replacing newer views.
 - Reuse imported Kenney GLB mesh/material handles for trees, conifers, grass, shrubs, rocks and suburban buildings. Apply GIS-driven placement, regional density allowances and distance hiding. Git LFS stores model and texture binaries; native packages include the complete curated set. Profile before adding custom instancing or adaptive LOD.
 - Self-contained snapshots include source fields, river paths, cells, display settings and provenance. General terrain tools, broader project workflow and performance gates follow in M3–M6.
 

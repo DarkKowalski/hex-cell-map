@@ -2,19 +2,24 @@
 use crate::{
     elevation::{DisplayVertex, ReliefField},
     hydrology::{Hydrology, WaterVertex, clip_polygon},
+    i18n::Message,
     jobs::JobContext,
     map_core::*,
 };
 use anyhow::Result;
 use geo::{Contains, Coord, LineString, MultiPolygon, Polygon, algorithm::unary_union};
+use rayon::prelude::*;
 use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Mutex,
+};
 pub const SUBDIVISIONS: i32 = 4;
 /// Integer coordinates in the normalized hex basis. Hex edges are exactly
 /// vertical or diagonal, so clipped vertices can share exact straight edges.
 pub type VertexKey = (i64, i64);
 const KEY_SCALE: f64 = 1_000_000.;
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Corner {
     pub position: [f32; 3],
     pub normal: [f32; 3],
@@ -22,7 +27,7 @@ pub struct Corner {
     pub materials: [f32; 4],
     pub display: DisplayVertex,
 }
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ChunkGeometry {
     pub id: (i32, i32),
     pub positions: Vec<[f32; 3]>,
@@ -59,6 +64,18 @@ pub struct TerrainGeometry {
     pub outlines: Vec<Vec<VertexKey>>,
     pub heights: HeightSettings,
     pub hydrology: Hydrology,
+}
+
+struct CellGeometry {
+    id: usize,
+    triangles: Vec<[VertexKey; 3]>,
+    outline: Vec<VertexKey>,
+}
+
+struct BuiltChunk {
+    land: ChunkGeometry,
+    water: ChunkGeometry,
+    cells: Vec<CellGeometry>,
 }
 pub fn vertex_key(point: [f64; 2], spacing: f64) -> VertexKey {
     (
@@ -442,7 +459,7 @@ pub fn build(
     context: &JobContext,
 ) -> Result<TerrainGeometry> {
     heights.validate()?;
-    context.report(0.94, "Conditioning valley channels and shorelines")?;
+    context.report(0.94, Message::new("progress.conditioning"))?;
     let hydrology = Hydrology::build(document, context)?;
     let spacing = document.settings.spacing_km * 1000.;
     let relief = ReliefField::build(&document.height_field, spacing);
@@ -474,266 +491,299 @@ pub fn build(
         }
     }
     let footprints: HashMap<_, _> = waters
-        .iter()
+        .par_iter()
         .map(|(id, p)| {
-            (
+            context.check()?;
+            Ok((
                 *id,
                 water_footprint(p, document.cells[*id as usize].hex, spacing),
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let edges = shared_edges(document, &footprints, &banks);
-    let mut corners = BTreeMap::new();
-    let mut water_corners = BTreeMap::<VertexKey, Corner>::new();
-    let mut chunks = Vec::new();
-    let mut water_chunks = Vec::new();
-    let mut all_triangles = vec![vec![]; document.cells.len()];
-    let mut outlines = vec![vec![]; document.cells.len()];
-    let groups = document.chunk_ids();
+    let groups: Vec<_> = document.chunk_ids().into_iter().collect();
     let total = groups.len();
-    for (i, (id, ids)) in groups.into_iter().enumerate() {
-        context.report(
-            0.95 + 0.04 * i as f32 / total as f32,
-            format!("Building terrain chunk {}/{}", i + 1, total),
-        )?;
-        let mut chunk = ChunkGeometry::new(id);
-        let mut water = ChunkGeometry::new(id);
-        let mut local = HashMap::new();
-        for (n, cell_id) in ids.into_iter().enumerate() {
-            if n % 64 == 0 {
-                context.check()?;
-            }
-            let cell = &document.cells[cell_id];
-            let base = cell_triangles(cell.hex, spacing);
-            let bank_polygons = banks.get(&cell.id);
-            let empty = MultiPolygon::<f64>::new(vec![]);
-            let footprint = footprints.get(&cell.id).unwrap_or(&empty);
-            let boundary = boundary_chain(cell.hex, spacing, &edges);
-            let boundary_polygon = Polygon::new(
-                LineString::from(
-                    boundary
-                        .iter()
-                        .map(|k| (k.0 as f64, k.1 as f64))
-                        .collect::<Vec<_>>(),
-                ),
-                vec![],
-            );
-            let water_rings: Vec<_> = footprint
-                .0
-                .iter()
-                .flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()))
-                .map(|r| {
-                    r.0.iter()
-                        .map(|c| vertex_key([c.x, c.y], spacing))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let triangles: Vec<[VertexKey; 3]> = {
-                let mut points: BTreeSet<_> = base.iter().flatten().copied().collect();
-                points.extend(boundary.iter().copied());
-                points.extend(water_rings.iter().flatten().copied());
-                for poly in bank_polygons.into_iter().flatten() {
-                    points.extend(poly.iter().map(|v| vertex_key(v.point, spacing)));
+    context.report(0.95, Message::new("progress.building").arg("count", total))?;
+    let completed = Mutex::new(0);
+    // Indexed collection keeps chunk/cell order stable. Each worker owns all
+    // mutable geometry and caches; shared boundary vertices are pure samples.
+    let built: Vec<_> = groups
+        .into_par_iter()
+        .map(|(id, ids)| -> Result<BuiltChunk> {
+            context.check()?;
+            let mut water_corners = BTreeMap::<VertexKey, Corner>::new();
+            let mut chunk = ChunkGeometry::new(id);
+            let mut water = ChunkGeometry::new(id);
+            let mut local = HashMap::new();
+            let mut cells = Vec::with_capacity(ids.len());
+            for (n, cell_id) in ids.into_iter().enumerate() {
+                if n % 64 == 0 {
+                    context.check()?;
                 }
-                let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
-                let mut handles = HashMap::new();
-                for key in points {
-                    handles.insert(key, cdt.insert(Point2::new(key.0 as f64, key.1 as f64))?);
-                }
-                for j in 0..boundary.len() {
-                    let a = handles[&boundary[j]];
-                    let b = handles[&boundary[(j + 1) % boundary.len()]];
-                    if a != b && cdt.can_add_constraint(a, b) {
-                        cdt.add_constraint(a, b);
-                    }
-                }
-                // Union outlines have no internal crossings. Insert them before
-                // bank detail constraints so no face bridges a water boundary.
-                for ring in &water_rings {
-                    for pair in ring.windows(2) {
-                        let a = handles[&pair[0]];
-                        let b = handles[&pair[1]];
-                        if a != b && cdt.can_add_constraint(a, b) {
-                            cdt.add_constraint(a, b);
-                        }
-                    }
-                }
-                for poly in bank_polygons.into_iter().flatten() {
-                    for j in 0..poly.len() {
-                        let a = handles[&vertex_key(poly[j].point, spacing)];
-                        let b = handles[&vertex_key(poly[(j + 1) % poly.len()].point, spacing)];
-                        if a != b && cdt.can_add_constraint(a, b) {
-                            cdt.add_constraint(a, b);
-                        }
-                    }
-                }
-                cdt.inner_faces()
-                    .filter_map(|f| {
-                        let p = f.vertices().map(|v| [v.position().x, v.position().y]);
-                        let centroid = [
-                            (p[0][0] + p[1][0] + p[2][0]) / 3.,
-                            (p[0][1] + p[1][1] + p[2][1]) / 3.,
-                        ];
-                        boundary_polygon
-                            .contains(&geo::Point::from(centroid))
-                            .then(|| p.map(|p| (p[0].round() as i64, p[1].round() as i64)))
+                let cell = &document.cells[cell_id];
+                let base = cell_triangles(cell.hex, spacing);
+                let bank_polygons = banks.get(&cell.id);
+                let empty = MultiPolygon::<f64>::new(vec![]);
+                let footprint = footprints.get(&cell.id).unwrap_or(&empty);
+                let boundary = boundary_chain(cell.hex, spacing, &edges);
+                let boundary_polygon = Polygon::new(
+                    LineString::from(
+                        boundary
+                            .iter()
+                            .map(|k| (k.0 as f64, k.1 as f64))
+                            .collect::<Vec<_>>(),
+                    ),
+                    vec![],
+                );
+                let water_rings: Vec<_> = footprint
+                    .0
+                    .iter()
+                    .flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors()))
+                    .map(|r| {
+                        r.0.iter()
+                            .map(|c| vertex_key([c.x, c.y], spacing))
+                            .collect::<Vec<_>>()
                     })
-                    .collect()
-            };
-            for keys in &triangles {
-                for &key in keys {
-                    let index = if let Some(index) = local.get(&key) {
-                        *index
+                    .collect();
+                let triangles: Vec<[VertexKey; 3]> = {
+                    let mut points: BTreeSet<_> = base.iter().flatten().copied().collect();
+                    points.extend(boundary.iter().copied());
+                    points.extend(water_rings.iter().flatten().copied());
+                    for poly in bank_polygons.into_iter().flatten() {
+                        points.extend(poly.iter().map(|v| vertex_key(v.point, spacing)));
+                    }
+                    let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
+                    let mut handles = HashMap::new();
+                    for key in points {
+                        handles.insert(key, cdt.insert(Point2::new(key.0 as f64, key.1 as f64))?);
+                    }
+                    for j in 0..boundary.len() {
+                        let a = handles[&boundary[j]];
+                        let b = handles[&boundary[(j + 1) % boundary.len()]];
+                        if a != b && cdt.can_add_constraint(a, b) {
+                            cdt.add_constraint(a, b);
+                        }
+                    }
+                    // Union outlines have no internal crossings. Insert them before
+                    // bank detail constraints so no face bridges a water boundary.
+                    for ring in &water_rings {
+                        for pair in ring.windows(2) {
+                            let a = handles[&pair[0]];
+                            let b = handles[&pair[1]];
+                            if a != b && cdt.can_add_constraint(a, b) {
+                                cdt.add_constraint(a, b);
+                            }
+                        }
+                    }
+                    for poly in bank_polygons.into_iter().flatten() {
+                        for j in 0..poly.len() {
+                            let a = handles[&vertex_key(poly[j].point, spacing)];
+                            let b = handles[&vertex_key(poly[(j + 1) % poly.len()].point, spacing)];
+                            if a != b && cdt.can_add_constraint(a, b) {
+                                cdt.add_constraint(a, b);
+                            }
+                        }
+                    }
+                    cdt.inner_faces()
+                        .filter_map(|f| {
+                            let p = f.vertices().map(|v| [v.position().x, v.position().y]);
+                            let centroid = [
+                                (p[0][0] + p[1][0] + p[2][0]) / 3.,
+                                (p[0][1] + p[1][1] + p[2][1]) / 3.,
+                            ];
+                            boundary_polygon
+                                .contains(&geo::Point::from(centroid))
+                                .then(|| p.map(|p| (p[0].round() as i64, p[1].round() as i64)))
+                        })
+                        .collect()
+                };
+                for keys in &triangles {
+                    for &key in keys {
+                        let index = if let Some(index) = local.get(&key) {
+                            *index
+                        } else {
+                            let vertex = {
+                                let p = vertex_point(key, spacing);
+                                let h = terrain_height(document, &hydrology, p)?;
+                                let epsilon = (document.height_field.step_m * 0.08).max(1.);
+                                let east =
+                                    terrain_height(document, &hydrology, [p[0] + epsilon, p[1]])?;
+                                let west =
+                                    terrain_height(document, &hydrology, [p[0] - epsilon, p[1]])?;
+                                let north =
+                                    terrain_height(document, &hydrology, [p[0], p[1] + epsilon])?;
+                                let south =
+                                    terrain_height(document, &hydrology, [p[0], p[1] - epsilon])?;
+                                let source_east = source_height(document, [p[0] + epsilon, p[1]])?;
+                                let source_west = source_height(document, [p[0] - epsilon, p[1]])?;
+                                let source_north = source_height(document, [p[0], p[1] + epsilon])?;
+                                let source_south = source_height(document, [p[0], p[1] - epsilon])?;
+                                let slope = (source_east - source_west)
+                                    .hypot(source_north - source_south)
+                                    / (2. * epsilon);
+                                let samples = [
+                                    (p, h),
+                                    ([p[0] + epsilon, p[1]], east),
+                                    ([p[0] - epsilon, p[1]], west),
+                                    ([p[0], p[1] + epsilon], north),
+                                    ([p[0], p[1] - epsilon], south),
+                                ]
+                                .map(|(point, height)| {
+                                    relief.sample(document, &hydrology, point, height)
+                                });
+                                let display = DisplayVertex { samples, epsilon };
+                                let mut position = world_position(p, h, heights);
+                                position[1] = (display.meters(heights) / 1000.) as f32;
+                                Corner {
+                                    position,
+                                    normal: display.normal(heights),
+                                    weights: palette(document, p, slope, Some(&hydrology)),
+                                    materials: material_weights(document, p, slope, &hydrology),
+                                    display,
+                                }
+                            };
+                            let index = chunk.positions.len() as u32;
+                            chunk.positions.push(vertex.position);
+                            chunk.normals.push(vertex.normal);
+                            chunk.weights.push(vertex.weights);
+                            chunk.materials.push(vertex.materials);
+                            chunk.display.push(vertex.display);
+                            chunk.boundaries.insert(key, vertex);
+                            local.insert(key, index);
+                            index
+                        };
+                        chunk.indices.push(index);
+                    }
+                    chunk.triangle_cells.push(cell.id);
+                }
+                // Both land and water use one refined planar triangulation. A face
+                // is rendered as water only inside the union of all wet footprints.
+                for keys in &triangles {
+                    let keys = *keys;
+                    let points = keys.map(|k| vertex_point(k, spacing));
+                    let centroid = [
+                        points.iter().map(|p| p[0]).sum::<f64>() / 3.,
+                        points.iter().map(|p| p[1]).sum::<f64>() / 3.,
+                    ];
+                    if !footprint.contains(&geo::Point::from(centroid)) {
+                        continue;
+                    }
+                    let area = (points[1][0] - points[0][0]) * (points[2][1] - points[0][1])
+                        - (points[1][1] - points[0][1]) * (points[2][0] - points[0][0]);
+                    if area.abs() < 0.01 {
+                        continue;
+                    }
+                    let keys = if area < 0. {
+                        [keys[0], keys[2], keys[1]]
                     } else {
-                        let vertex = if let Some(v) = corners.get(&key) {
+                        keys
+                    };
+                    let mut vertices = Vec::with_capacity(3);
+                    for key in keys {
+                        let vertex = if let Some(v) = water_corners.get(&key) {
                             *v
                         } else {
                             let p = vertex_point(key, spacing);
-                            let h = terrain_height(document, &hydrology, p)?;
-                            let epsilon = (document.height_field.step_m * 0.08).max(1.);
-                            let east =
-                                terrain_height(document, &hydrology, [p[0] + epsilon, p[1]])?;
-                            let west =
-                                terrain_height(document, &hydrology, [p[0] - epsilon, p[1]])?;
-                            let north =
-                                terrain_height(document, &hydrology, [p[0], p[1] + epsilon])?;
-                            let south =
-                                terrain_height(document, &hydrology, [p[0], p[1] - epsilon])?;
-                            let source_east = source_height(document, [p[0] + epsilon, p[1]])?;
-                            let source_west = source_height(document, [p[0] - epsilon, p[1]])?;
-                            let source_north = source_height(document, [p[0], p[1] + epsilon])?;
-                            let source_south = source_height(document, [p[0], p[1] - epsilon])?;
-                            let slope = (source_east - source_west)
-                                .hypot(source_north - source_south)
-                                / (2. * epsilon);
-                            let samples = [
-                                (p, h),
-                                ([p[0] + epsilon, p[1]], east),
-                                ([p[0] - epsilon, p[1]], west),
-                                ([p[0], p[1] + epsilon], north),
-                                ([p[0], p[1] - epsilon], south),
-                            ]
-                            .map(|(point, height)| {
-                                relief.sample(document, &hydrology, point, height)
-                            });
-                            let display = DisplayVertex { samples, epsilon };
-                            let mut position = world_position(p, h, heights);
-                            position[1] = (display.meters(heights) / 1000.) as f32;
-                            let vertex = Corner {
-                                position,
-                                normal: display.normal(heights),
-                                weights: palette(document, p, slope, Some(&hydrology)),
-                                materials: material_weights(document, p, slope, &hydrology),
-                                display,
-                            };
-                            corners.insert(key, vertex);
-                            vertex
-                        };
-                        let index = chunk.positions.len() as u32;
-                        chunk.positions.push(vertex.position);
-                        chunk.normals.push(vertex.normal);
-                        chunk.weights.push(vertex.weights);
-                        chunk.materials.push(vertex.materials);
-                        chunk.display.push(vertex.display);
-                        chunk.boundaries.insert(key, vertex);
-                        local.insert(key, index);
-                        index
-                    };
-                    chunk.indices.push(index);
-                }
-                chunk.triangle_cells.push(cell.id);
-            }
-            // Both land and water use one refined planar triangulation. A face
-            // is rendered as water only inside the union of all wet footprints.
-            for keys in &triangles {
-                let keys = *keys;
-                let points = keys.map(|k| vertex_point(k, spacing));
-                let centroid = [
-                    points.iter().map(|p| p[0]).sum::<f64>() / 3.,
-                    points.iter().map(|p| p[1]).sum::<f64>() / 3.,
-                ];
-                if !footprint.contains(&geo::Point::from(centroid)) {
-                    continue;
-                }
-                let area = (points[1][0] - points[0][0]) * (points[2][1] - points[0][1])
-                    - (points[1][1] - points[0][1]) * (points[2][0] - points[0][0]);
-                if area.abs() < 0.01 {
-                    continue;
-                }
-                let keys = if area < 0. {
-                    [keys[0], keys[2], keys[1]]
-                } else {
-                    keys
-                };
-                let mut vertices = Vec::with_capacity(3);
-                for key in keys {
-                    let vertex = if let Some(v) = water_corners.get(&key) {
-                        *v
-                    } else {
-                        let p = vertex_point(key, spacing);
-                        let (level, edge) =
+                            let (level, edge) =
                             hydrology.surface_sample(document, p).ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "Water footprint has no reference level at {p:?} in hex {:?}",
                                     cell.hex
                                 )
                             })?;
-                        let epsilon = (document.height_field.step_m * 0.08).max(1.);
-                        // Dry samples outside the wet footprint must not tilt
-                        // a shoreline normal toward a different nearby pool.
-                        let sample = |q| hydrology.water_level(document, q).unwrap_or(level);
-                        let gradient = [
-                            (sample([p[0] + epsilon, p[1]]) - sample([p[0] - epsilon, p[1]]))
-                                / (2. * epsilon),
-                            (sample([p[0], p[1] + epsilon]) - sample([p[0], p[1] - epsilon]))
-                                / (2. * epsilon),
-                        ];
-                        let display = DisplayVertex::water(level + 0.5, gradient);
-                        let vertex = Corner {
-                            position: world_position(p, level + 0.5, heights),
-                            normal: display.normal(heights),
-                            weights: [
-                                0.018 + 0.025 * edge as f32,
-                                0.10 + 0.045 * edge as f32,
-                                0.14 + 0.02 * edge as f32,
-                                edge as f32,
-                            ],
-                            materials: [0.; 4],
-                            display,
+                            let epsilon = (document.height_field.step_m * 0.08).max(1.);
+                            // Dry samples outside the wet footprint must not tilt
+                            // a shoreline normal toward a different nearby pool.
+                            let sample = |q| hydrology.water_level(document, q).unwrap_or(level);
+                            let gradient = [
+                                (sample([p[0] + epsilon, p[1]]) - sample([p[0] - epsilon, p[1]]))
+                                    / (2. * epsilon),
+                                (sample([p[0], p[1] + epsilon]) - sample([p[0], p[1] - epsilon]))
+                                    / (2. * epsilon),
+                            ];
+                            let display = DisplayVertex::water(level + 0.5, gradient);
+                            let vertex = Corner {
+                                position: world_position(p, level + 0.5, heights),
+                                normal: display.normal(heights),
+                                weights: [
+                                    0.018 + 0.025 * edge as f32,
+                                    0.10 + 0.045 * edge as f32,
+                                    0.14 + 0.02 * edge as f32,
+                                    edge as f32,
+                                ],
+                                materials: [0.; 4],
+                                display,
+                            };
+                            water_corners.insert(key, vertex);
+                            vertex
                         };
-                        water_corners.insert(key, vertex);
-                        vertex
-                    };
-                    vertices.push((key, vertex));
+                        vertices.push((key, vertex));
+                    }
+                    // Meter coordinates become f32 kilometers on the GPU. Discard
+                    // faces that collapse at that precision before they reach it.
+                    let [a, b, c] = std::array::from_fn::<_, 3, _>(|i| vertices[i].1.position);
+                    let area_gpu = (b[0] - a[0]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[0] - a[0]);
+                    let centroid_gpu = [
+                        (f64::from(a[0]) + f64::from(b[0]) + f64::from(c[0])) * 1000. / 3.,
+                        -(f64::from(a[2]) + f64::from(b[2]) + f64::from(c[2])) * 1000. / 3.,
+                    ];
+                    if area_gpu >= 0. || point_hex(centroid_gpu, spacing) != cell.hex {
+                        continue;
+                    }
+                    for (key, v) in vertices {
+                        water.indices.push(water.positions.len() as u32);
+                        water.positions.push(v.position);
+                        water.normals.push(v.normal);
+                        water.weights.push(v.weights);
+                        water.materials.push(v.materials);
+                        water.display.push(v.display);
+                        water.boundaries.insert(key, v);
+                    }
+                    water.triangle_cells.push(cell.id);
                 }
-                // Meter coordinates become f32 kilometers on the GPU. Discard
-                // faces that collapse at that precision before they reach it.
-                let [a, b, c] = std::array::from_fn::<_, 3, _>(|i| vertices[i].1.position);
-                let area_gpu = (b[0] - a[0]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[0] - a[0]);
-                let centroid_gpu = [
-                    (f64::from(a[0]) + f64::from(b[0]) + f64::from(c[0])) * 1000. / 3.,
-                    -(f64::from(a[2]) + f64::from(b[2]) + f64::from(c[2])) * 1000. / 3.,
-                ];
-                if area_gpu >= 0. || point_hex(centroid_gpu, spacing) != cell.hex {
-                    continue;
-                }
-                for (key, v) in vertices {
-                    water.indices.push(water.positions.len() as u32);
-                    water.positions.push(v.position);
-                    water.normals.push(v.normal);
-                    water.weights.push(v.weights);
-                    water.materials.push(v.materials);
-                    water.display.push(v.display);
-                    water.boundaries.insert(key, v);
-                }
-                water.triangle_cells.push(cell.id);
+                cells.push(CellGeometry {
+                    id: cell_id,
+                    triangles,
+                    outline: boundary,
+                });
             }
-            all_triangles[cell_id] = triangles;
-            outlines[cell_id] = boundary;
+            // Serialize the increment and send so completion progress stays ordered.
+            let mut completed = completed.lock().unwrap();
+            *completed += 1;
+            context.report(
+                0.95 + 0.04 * *completed as f32 / total as f32,
+                Message::new("progress.built")
+                    .arg("completed", *completed)
+                    .arg("total", total),
+            )?;
+            Ok(BuiltChunk {
+                land: chunk,
+                water,
+                cells,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let mut corners = BTreeMap::new();
+    let mut chunks = Vec::with_capacity(total);
+    let mut water_chunks = Vec::new();
+    let mut all_triangles = vec![vec![]; document.cells.len()];
+    let mut outlines = vec![vec![]; document.cells.len()];
+    for built in built {
+        context.check()?;
+        corners.extend(
+            built
+                .land
+                .boundaries
+                .iter()
+                .map(|(key, vertex)| (*key, *vertex)),
+        );
+        chunks.push(built.land);
+        if !built.water.indices.is_empty() {
+            water_chunks.push(built.water);
         }
-        chunks.push(chunk);
-        if !water.indices.is_empty() {
-            water_chunks.push(water);
+        for cell in built.cells {
+            all_triangles[cell.id] = cell.triangles;
+            outlines[cell.id] = cell.outline;
         }
     }
     context.check()?;
@@ -879,6 +929,47 @@ mod tests {
     }
     fn closed_boundaries(g: &TerrainGeometry) {
         validate_topology(g).unwrap();
+    }
+
+    #[test]
+    fn parallel_chunks_preserve_geometry_seams_and_progress() -> Result<()> {
+        let mut d = fixture()?;
+        d.cells
+            .retain(|c| c.center_m[0].abs() < 6000. && c.center_m[1].abs() < 6000.);
+        for (id, cell) in d.cells.iter_mut().enumerate() {
+            cell.id = id as u32;
+        }
+        d.rebuild_index()?;
+        assert!(d.chunk_ids().len() >= 4);
+        d.river_paths.push(RiverPath {
+            id: 1,
+            next_down: 0,
+            discharge: 50.,
+            stream_order: 4,
+            points_m: vec![[-5000., 5000.], [0., 0.], [5000., -5000.]],
+        });
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()?
+            .install(|| build(&d, d.heights, &JobContext::default()))?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let context = JobContext::with_progress(sender);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+        let parallel = pool.install(|| build(&d, d.heights, &context))?;
+        assert_eq!(serial.chunks, parallel.chunks);
+        assert_eq!(serial.water_chunks, parallel.water_chunks);
+        assert_eq!(serial.corners, parallel.corners);
+        assert_eq!(serial.triangles, parallel.triangles);
+        assert_eq!(serial.outlines, parallel.outlines);
+        assert!(!parallel.water_chunks.is_empty());
+        assert!(seams(&parallel) > 0);
+        closed_boundaries(&parallel);
+        let progress: Vec<_> = receiver.try_iter().collect();
+        assert!(progress.windows(2).all(|p| p[0].fraction <= p[1].fraction));
+        assert_eq!(progress.last().unwrap().fraction, 0.99);
+        context.cancel();
+        assert!(pool.install(|| build(&d, d.heights, &context)).is_err());
+        Ok(())
     }
 
     #[test]

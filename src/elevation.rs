@@ -3,7 +3,7 @@ use crate::{
     hydrology::Hydrology,
     map_core::{HeightField, HeightSettings, MapDocument},
 };
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct HeightSample {
     pub height: f64,
     pub detail: f64,
@@ -19,7 +19,7 @@ impl HeightSample {
         settings.meters(self.height) + f64::from(settings.scale) * gain * detail * self.dry
     }
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplayVertex {
     pub samples: [HeightSample; 5],
     pub epsilon: f64,

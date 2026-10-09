@@ -9,12 +9,13 @@ default-run = "hex-cell-map"
 
 [features]
 default = ["desktop"]
-desktop = ["dep:bevy", "dep:bevy_egui"]
+desktop = ["dep:bevy", "dep:bevy_egui", "dep:sys-locale"]
 
 [dependencies]
 anyhow = "1"
 bevy = { version = "=0.19.1", optional = true, default-features = false, features = ["default_app", "std", "bevy_winit", "3d_bevy_render", "mesh_picking", "multi_threaded", "default_font", "png"] }
 bevy_egui = { version = "=0.42.0", optional = true, default-features = false, features = ["render", "default_fonts", "open_url"] }
+sys-locale = { version = "0.3", optional = true }
 gdal = { version = "=0.19.0", features = ["gdal-src", "bindgen"] }
 gdal-src = { version = "=0.3.0", default-features = false, features = ["driver_gtiff", "driver_shape", "driver_geojson", "driver_mem", "curl-sys"] }
 gdal-sys = { version = "0.12", features = ["bundled", "bindgen"] }
@@ -28,6 +29,7 @@ sha2 = "0.10"
 tempfile = "3"
 dirs = "6"
 spade = "=2.15.1"
+rayon = "1"
 
 [target.'cfg(unix)'.dependencies]
 curl-sys = { version = "0.4", features = ["static-curl", "static-ssl"] }

@@ -1,10 +1,12 @@
 use super::cache::{Cache, source_record};
+use crate::i18n::Message;
 use crate::{
     jobs::JobContext,
     map_core::{Region, SourceRecord},
 };
 use anyhow::{Context, Result, ensure};
 use gdal::{Dataset, raster::ResampleAlg};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fs};
 
@@ -118,15 +120,25 @@ pub fn acquire(
     };
     let west = (region.west.floor() as i32).div_euclid(tile_degrees) * tile_degrees;
     let south = (region.south.floor() as i32).div_euclid(tile_degrees) * tile_degrees;
-    let mut windows = Vec::new();
+    let mut tiles = Vec::new();
     for lat in (south..region.north.ceil() as i32).step_by(tile_degrees as usize) {
         for lon in (west..region.east.ceil() as i32).step_by(tile_degrees as usize) {
+            tiles.push((lon, lat));
+        }
+    }
+    let mut windows = Vec::new();
+    // Limit active range reads and temporary sample buffers to four tiles.
+    // Each task opens its own GDAL dataset, and indexed collection retains
+    // geographic tile order regardless of worker completion order.
+    for batch in tiles.chunks(4) {
+        context.check()?;
+        let acquired: Vec<_> = batch.par_iter().map(|&(lon, lat)| -> Result<Option<RasterWindow>> {
             context.check()?;
             let tile = tile_name(lon, lat, kind);
             if let Some(index) = &dem_index
                 && !index.contains(&tile)
             {
-                continue;
+                return Ok(None);
             }
             let url = match kind {
                 RasterKind::Elevation => {
@@ -145,10 +157,9 @@ pub fn acquire(
                         && window.values.len() == window.width * window.height,
                     "Invalid cached raster dimensions"
                 );
-                windows.push(window);
-                continue;
+                return Ok(Some(window));
             }
-            context.report(base_progress, format!("Reading {label}: {lat}°, {lon}°"))?;
+            context.report(base_progress, Message::new("progress.reading_raster").arg("label", label).arg("lat", lat).arg("lon", lon))?;
             let dataset = Dataset::open(format!("/vsicurl/{url}"))
                 .with_context(|| format!("Open required {label} tile {url}"))?;
             let transform = dataset.geo_transform()?;
@@ -175,7 +186,7 @@ pub fn acquire(
                 .ceil()
                 .min(full_height as f64) as usize;
             if x1 <= x0 || y1 <= y0 {
-                continue;
+                return Ok(None);
             }
             let bounds = [
                 transform[0] + x0 as f64 * transform[1],
@@ -246,8 +257,9 @@ pub fn acquire(
             };
             context.check()?;
             cache.write_json(&filename, &window)?;
-            windows.push(window);
-        }
+            Ok(Some(window))
+        }).collect::<Result<_>>()?;
+        windows.extend(acquired.into_iter().flatten());
     }
     Ok(RasterLayer { windows })
 }

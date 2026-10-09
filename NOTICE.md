@@ -8,6 +8,7 @@ Generated documents retain input URLs, versions, timestamps, hashes, credits, an
 - **GeoNames cities1000**: Contains modified [GeoNames](https://www.geonames.org) data, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The downloaded daily snapshot is cached; regenerate from the same snapshot for reproducible results.
 - **Natural Earth 1:110m land**: [Public domain](https://www.naturalearthdata.com/about/terms-of-use/). Bundled overview data from the [Natural Earth vector repository](https://github.com/nvkelso/natural-earth-vector).
 - **Mozilla certificate roots**: `assets/cacert.pem`, obtained from [curl's Mozilla CA extract](https://curl.se/docs/caextract.html). Mozilla certificate-store data is distributed under [MPL 2.0](https://www.mozilla.org/MPL/2.0/).
+- **Noto Sans SC Regular**: Bundled Chinese UI font from [Noto CJK](https://github.com/notofonts/noto-cjk), distributed under the SIL Open Font License 1.1. The original license is retained in `assets/fonts/OFL.txt`; the pinned source and checksum are recorded in `assets/fonts/README.md`. The font is embedded in the desktop executable and included with its license in native packages.
 
 Native dependencies include GDAL (MIT-style license), PROJ (MIT-style license), SQLite (public domain), libcurl (curl license), OpenSSL (Apache 2.0 on Unix builds), and zlib (zlib license). Rust dependencies retain their own licenses. Release packaging includes notices from the resolved source dependencies.
 

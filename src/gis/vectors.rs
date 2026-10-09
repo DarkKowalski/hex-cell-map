@@ -1,4 +1,5 @@
 use super::cache::{Cache, source_record};
+use crate::i18n::Message;
 use crate::{
     jobs::JobContext,
     map_core::{City, Projection, Region, SourceRecord},
@@ -48,7 +49,10 @@ pub fn rivers(
         let (archive, etag) = cache.download(&url, &filename, context, 0.5)?;
         let directory = cache.root.join(format!("rivers-{continent}"));
         let shapefile = extract_shape(&archive, &directory, context)?;
-        context.report(0.55, format!("Reading HydroRIVERS ({continent})"))?;
+        context.report(
+            0.55,
+            Message::new("progress.reading_rivers").arg("continent", continent),
+        )?;
         let dataset = Dataset::open(&shapefile)?;
         let mut layer = dataset.layer(0)?;
         layer.set_spatial_filter_rect(region.west, region.south, region.east, region.north);

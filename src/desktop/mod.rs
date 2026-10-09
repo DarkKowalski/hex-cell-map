@@ -2,12 +2,14 @@
 //! cancellable worker; only complete, current revisions reach the live scene.
 mod art;
 mod camera;
+mod language;
 mod scene;
 mod ui;
 
 use crate::{
     generation,
     gis::cache::Cache,
+    i18n::{Locale, Message},
     jobs::{JobContext, Progress},
     map_core::*,
     terrain::{self, TerrainGeometry},
@@ -64,6 +66,7 @@ pub struct MapView {
 
 #[derive(Resource)]
 pub struct UiState {
+    pub locale: Locale,
     pub settings: GenerationSettings,
     pub estimate: std::result::Result<usize, String>,
     pub last_estimated: Option<GenerationSettings>,
@@ -89,13 +92,14 @@ pub struct UiState {
     pub models: bool,
     pub grid: bool,
     pub credits: bool,
-    pub status: String,
+    pub status: Message,
     pub error: Option<String>,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
+            locale: Locale::En,
             settings: GenerationSettings::default(),
             estimate: Ok(0),
             last_estimated: None,
@@ -119,9 +123,9 @@ impl Default for UiState {
             save_requested: false,
             load_requested: false,
             models: true,
-            grid: false,
+            grid: true,
             credits: false,
-            status: "Select a region to begin".into(),
+            status: Message::new("status.begin"),
             error: None,
         }
     }
@@ -184,9 +188,18 @@ struct LaunchOptions {
 
 pub fn run() -> Result<()> {
     let mut options = LaunchOptions::default();
+    let mut locale = language::initial_locale();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--lang" => {
+                let tag = args.next().context("Missing language: use en or zh-CN")?;
+                locale = match tag.as_str() {
+                    "en" => Locale::En,
+                    "zh-CN" => Locale::ZhCn,
+                    _ => anyhow::bail!("Unsupported language {tag}; use en or zh-CN"),
+                };
+            }
             "--preview" => {
                 options.input = Some(PathBuf::from(
                     args.next().context("Missing validation artifact")?,
@@ -218,7 +231,7 @@ pub fn run() -> Result<()> {
             }
             "--help" => {
                 println!(
-                    "hex-cell-map [--preview GIS_PROBE_JSON] [--smoke --screenshot FILE.png] [--outlines] [--focus Q R --distance KM]\nGenerate real GIS maps using the native window. Preview inputs and smoke camera options are development validation tools, not portable user projects."
+                    "hex-cell-map [--lang en|zh-CN] [--preview GIS_PROBE_JSON] [--smoke --screenshot FILE.png] [--outlines] [--focus Q R --distance KM]\nGenerate real GIS maps using the native window. Preview inputs and smoke camera options are development validation tools, not portable user projects."
                 );
                 return Ok(());
             }
@@ -235,7 +248,7 @@ pub fn run() -> Result<()> {
         options.smoke || (options.focus.is_none() && options.distance.is_none()),
         "Focus and distance options require --smoke"
     );
-    let grid = options.outlines;
+    let grid = !options.smoke || options.outlines;
     let asset_root = art::asset_root()?;
     let mut app = App::new();
     app.add_plugins(
@@ -246,7 +259,7 @@ pub fn run() -> Result<()> {
             })
             .set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "Hex Cell Map".into(),
+                    title: locale.text("window.title").into(),
                     resolution: (1440, 960).into(),
                     ..default()
                 }),
@@ -262,7 +275,11 @@ pub fn run() -> Result<()> {
     })
     .insert_resource(options)
     .init_resource::<MapView>()
-    .insert_resource(UiState { grid, ..default() })
+    .insert_resource(UiState {
+        locale,
+        grid,
+        ..default()
+    })
     .init_resource::<Jobs>()
     .init_resource::<OrbitCamera>()
     .add_systems(
@@ -284,7 +301,14 @@ pub fn run() -> Result<()> {
     )
     .add_systems(
         EguiPrimaryContextPass,
-        (ui::show, camera::controls, scene::pick, scene::overlay).chain(),
+        (
+            ui::setup_context,
+            ui::show,
+            camera::controls,
+            scene::pick,
+            scene::overlay,
+        )
+            .chain(),
     )
     .add_systems(PostUpdate, scene::smoke_validation);
     embedded_asset!(app, "terrain.wgsl");
@@ -305,7 +329,7 @@ fn launch_preview(options: Res<LaunchOptions>, mut jobs: ResMut<Jobs>, mut ui: R
             let heights = document.heights;
             prepare(Arc::new(document), heights, context)
         }));
-        ui.status = "Preparing real GIS preview".into();
+        ui.status = Message::new("status.preview");
     }
 }
 
@@ -343,7 +367,10 @@ fn start_jobs(mut jobs: ResMut<Jobs>, view: Res<MapView>, mut ui: ResMut<UiState
         ui.save_requested = false;
         if let Some(document) = &view.document {
             match crate::project::save(document, std::path::Path::new(&ui.project_path)) {
-                Ok(()) => ui.status = "Project saved".into(),
+                Ok(()) => {
+                    ui.status = Message::new("status.saved");
+                    ui.error = None;
+                }
                 Err(e) => ui.error = Some(format!("{e:#}")),
             }
         }
@@ -351,6 +378,7 @@ fn start_jobs(mut jobs: ResMut<Jobs>, view: Res<MapView>, mut ui: ResMut<UiState
     if ui.load_requested {
         ui.load_requested = false;
         ui.error = None;
+        ui.status = Message::new("status.opening");
         let path = PathBuf::from(&ui.project_path);
         jobs.sequence += 1;
         jobs.active = Some(spawn_job(jobs.sequence, true, move |context| {
@@ -361,6 +389,7 @@ fn start_jobs(mut jobs: ResMut<Jobs>, view: Res<MapView>, mut ui: ResMut<UiState
     } else if ui.generate_requested {
         ui.generate_requested = false;
         ui.error = None;
+        ui.status = Message::new("status.generating");
         let settings = ui.settings.clone();
         let heights = ui.heights;
         jobs.sequence += 1;
@@ -410,6 +439,7 @@ fn start_jobs(mut jobs: ResMut<Jobs>, view: Res<MapView>, mut ui: ResMut<UiState
             ui.undo.remove(0);
         }
         if let Some(document) = next {
+            ui.status = Message::new("status.updating");
             let heights = ui.heights;
             jobs.sequence += 1;
             jobs.active = Some(spawn_job(jobs.sequence, false, move |context| {
@@ -477,7 +507,7 @@ fn poll_jobs(
         return;
     }
     if !art.ready && job.context.check().is_ok() {
-        ui.status = "Loading landscape art".into();
+        ui.status = Message::new("status.loading_art");
         return;
     }
     let result = job.result.lock().unwrap().try_recv();
@@ -488,7 +518,7 @@ fn poll_jobs(
             let cancelled = job.context.check().is_err();
             jobs.active = None;
             if cancelled {
-                ui.status = "Generation cancelled".into();
+                ui.status = Message::new("status.cancelled");
                 return;
             }
             match result {
@@ -516,16 +546,17 @@ fn poll_jobs(
                         orbit.fit(&prepared.document, prepared.geometry.heights);
                         view.selected = None;
                     }
-                    ui.status = format!(
-                        "{} hexes · {} cities",
-                        prepared.document.cells.len(),
-                        prepared
-                            .document
-                            .cells
-                            .iter()
-                            .map(|c| c.cities.len())
-                            .sum::<usize>()
-                    );
+                    ui.status = Message::new("status.complete")
+                        .arg("hexes", prepared.document.cells.len())
+                        .arg(
+                            "cities",
+                            prepared
+                                .document
+                                .cells
+                                .iter()
+                                .map(|c| c.cities.len())
+                                .sum::<usize>(),
+                        );
                     view.heights = prepared.geometry.heights;
                     view.outlines = prepared.geometry.outlines;
                     view.outline_water = prepared
@@ -546,7 +577,7 @@ fn poll_jobs(
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    ui.status = "Generation failed".into();
+                    ui.status = Message::new("status.failed");
                     ui.error = Some(error);
                 }
             }

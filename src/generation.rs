@@ -1,3 +1,4 @@
+use crate::i18n::Message;
 use crate::{
     gis::{
         cache::Cache,
@@ -10,6 +11,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use geo::Intersects;
 use hexx::Hex;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 
 /// Acquires all required GIS layers and returns a complete map atomically.
@@ -19,7 +21,7 @@ pub fn generate(
     context: &JobContext,
 ) -> Result<MapDocument> {
     settings.validate()?;
-    context.report(0.02, "Validating region and building hex grid")?;
+    context.report(0.02, Message::new("progress.validating"))?;
     let projection = Projection::new(settings.region)?;
     let (mut cells, bounds_m) = build_grid(settings, &projection)?;
     let spacing = settings.spacing_km * 1000.;
@@ -65,19 +67,12 @@ pub fn generate(
         settings.min_city_population,
         context,
     )?;
-    context.report(0.7, "Aggregating elevation and land cover")?;
-    aggregate_cells(
-        &mut cells,
-        settings,
-        &projection,
-        &elevation,
-        &cover,
-        context,
-    )?;
+    context.report(0.7, Message::new("progress.aggregating"))?;
+    aggregate_cells(&mut cells, settings, &elevation, &cover, context)?;
     let index: HashMap<_, _> = cells.iter().enumerate().map(|(i, c)| (c.hex, i)).collect();
-    context.report(0.85, "Rasterizing rivers into hex cells")?;
+    context.report(0.85, Message::new("progress.rivers"))?;
     rasterize_rivers(&mut cells, &index, &rivers, spacing, bounds_m, context)?;
-    context.report(0.92, "Assigning cities")?;
+    context.report(0.92, Message::new("progress.cities"))?;
     assign_cities(&mut cells, &index, cities, &projection, spacing)?;
     let mut sources = elevation.sources();
     sources.extend(cover.sources());
@@ -97,8 +92,14 @@ pub fn generate(
             )
         })
         .collect();
-    let height_field =
-        source_height_field(&cells, spacing, &projection, &elevation, &cover, context)?;
+    let height_field = source_height_field(
+        &cells,
+        spacing,
+        settings.region,
+        &elevation,
+        &cover,
+        context,
+    )?;
     let mut document = MapDocument {
         schema_version: 2,
         generator_version: "gis-hex-v3".into(),
@@ -116,10 +117,7 @@ pub fn generate(
     document.rebuild_index()?;
     context.report(
         1.,
-        format!(
-            "Generated {} hexes from real GIS data",
-            document.cells.len()
-        ),
+        Message::new("progress.generated").arg("count", document.cells.len()),
     )?;
     Ok(document)
 }
@@ -127,12 +125,12 @@ pub fn generate(
 fn source_height_field(
     cells: &[Cell],
     spacing: f64,
-    projection: &Projection,
+    region: Region,
     elevation: &RasterLayer,
     cover: &RasterLayer,
     context: &JobContext,
 ) -> Result<HeightField> {
-    context.report(0.93, "Sampling continuous DEM surface")?;
+    context.report(0.93, Message::new("progress.sampling"))?;
     let step = spacing / 4.;
     let radius = spacing / 3_f64.sqrt();
     let min_x = cells
@@ -158,34 +156,49 @@ fn source_height_field(
         width * height <= 2_000_000,
         "Continuous DEM surface exceeds sample limit"
     );
-    let mut elevations_m = Vec::with_capacity(width * height);
-    let mut land_cover = Vec::with_capacity(width * height);
-    for row in 0..height {
-        context.check()?;
-        let mut positions: Vec<_> = (0..width)
-            .map(|col| {
-                [
-                    origin_m[0] + col as f64 * step,
-                    origin_m[1] + row as f64 * step,
-                ]
-            })
-            .collect();
-        projection.unproject(&mut positions)?;
-        for [lon, lat] in positions {
-            let value = elevation
-                .sample_bilinear(lon, lat)
-                .or_else(|| (cover.sample(lon, lat) == Some(80.)).then_some(0.))
-                .with_context(|| {
-                    format!("Missing continuous DEM coverage at {lat:.5}°, {lon:.5}°")
-                })?;
-            elevations_m.push(value as f32);
-            land_cover.push(
-                cover
-                    .sample(lon, lat)
-                    .context("Missing surface land cover")? as u8,
-            );
-        }
-    }
+    let mut elevations_m = vec![0.; width * height];
+    let mut land_cover = vec![0; width * height];
+    // Each task owns its coordinate transform; GDAL handles are never shared.
+    let batch_size = width * 8;
+    elevations_m
+        .par_chunks_mut(batch_size)
+        .zip(land_cover.par_chunks_mut(batch_size))
+        .enumerate()
+        .try_for_each_init(
+            || None::<Projection>,
+            |projection, (batch, (elevations, classes))| -> Result<()> {
+                context.check()?;
+                let projection = match projection {
+                    Some(projection) => projection,
+                    slot @ None => slot.insert(Projection::new(region)?),
+                };
+                let mut positions: Vec<_> = (batch * batch_size
+                    ..batch * batch_size + elevations.len())
+                    .map(|i| {
+                        [
+                            origin_m[0] + (i % width) as f64 * step,
+                            origin_m[1] + (i / width) as f64 * step,
+                        ]
+                    })
+                    .collect();
+                projection.unproject(&mut positions)?;
+                for ((elevation_m, class), [lon, lat]) in
+                    elevations.iter_mut().zip(classes).zip(positions)
+                {
+                    let value = elevation
+                        .sample_bilinear(lon, lat)
+                        .or_else(|| (cover.sample(lon, lat) == Some(80.)).then_some(0.))
+                        .with_context(|| {
+                            format!("Missing continuous DEM coverage at {lat:.5}°, {lon:.5}°")
+                        })?;
+                    *elevation_m = value as f32;
+                    *class = cover
+                        .sample(lon, lat)
+                        .context("Missing surface land cover")? as u8;
+                }
+                Ok(())
+            },
+        )?;
     Ok(HeightField {
         origin_m,
         step_m: step,
@@ -199,7 +212,6 @@ fn source_height_field(
 fn aggregate_cells(
     cells: &mut [Cell],
     settings: &GenerationSettings,
-    projection: &Projection,
     elevation: &RasterLayer,
     cover: &RasterLayer,
     context: &JobContext,
@@ -214,70 +226,77 @@ fn aggregate_cells(
             offsets.push([radius * scale * angle.cos(), radius * scale * angle.sin()]);
         }
     }
-    for batch in cells.chunks_mut(512) {
-        context.check()?;
-        let mut positions: Vec<_> = batch
-            .iter()
-            .flat_map(|c| {
-                offsets
-                    .iter()
-                    .map(move |o| [c.center_m[0] + o[0], c.center_m[1] + o[1]])
-            })
-            .collect();
-        projection.unproject(&mut positions)?;
-        for (cell, samples) in batch.iter_mut().zip(positions.chunks(offsets.len())) {
-            let mut heights = Vec::new();
-            let mut trees = 0_u32;
-            let mut water = 0_u32;
-            for [lon, lat] in samples {
-                let class = cover.sample(*lon, *lat).with_context(|| {
-                    format!("Missing required land cover at {lat:.5}°, {lon:.5}°")
-                })? as u8;
-                ensure!(
-                    [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100].contains(&class),
-                    "Unknown WorldCover class {class} at {lat}, {lon}"
-                );
-                if class == 10 || class == 95 {
-                    trees += 1;
-                }
-                if class == 80 {
-                    water += 1;
-                }
-                let height = match elevation.sample(*lon, *lat) {
-                    Some(h) => h,
-                    None if class == 80 => 0.,
-                    None => {
-                        anyhow::bail!("Missing required land elevation at {lat:.5}°, {lon:.5}°")
-                    }
-                };
-                heights.push(height);
-            }
-            let mean = heights.iter().sum::<f64>() / heights.len() as f64;
-            let min = heights.iter().copied().fold(f64::INFINITY, f64::min);
-            let max = heights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let relief = max - min;
-            let slope = (relief / (radius * 1.64)).atan().to_degrees();
-            cell.generated_elevation_m = mean;
-            cell.elevation_m = mean;
-            cell.relief_m = relief;
-            cell.slope_degrees = slope;
-            cell.forest_fraction = f64::from(trees) / samples.len() as f64;
-            cell.water_fraction = f64::from(water) / samples.len() as f64;
-            cell.landscape = if relief >= settings.mountain_relief_m
-                || slope >= settings.mountain_slope_degrees
-            {
-                Landscape::Mountain
-            } else if cell.forest_fraction >= settings.forest_fraction {
-                Landscape::Forest
-            } else {
-                Landscape::Plains
+    cells.par_chunks_mut(512).try_for_each_init(
+        || None::<Projection>,
+        |projection, batch| {
+            context.check()?;
+            let projection = match projection {
+                Some(projection) => projection,
+                slot @ None => slot.insert(Projection::new(settings.region)?),
             };
-            if cell.water_fraction >= 0.5 {
-                cell.surface = Surface::Water;
+            let mut positions: Vec<_> = batch
+                .iter()
+                .flat_map(|c| {
+                    offsets
+                        .iter()
+                        .map(move |o| [c.center_m[0] + o[0], c.center_m[1] + o[1]])
+                })
+                .collect();
+            projection.unproject(&mut positions)?;
+            for (cell, samples) in batch.iter_mut().zip(positions.chunks(offsets.len())) {
+                let mut heights = Vec::new();
+                let mut trees = 0_u32;
+                let mut water = 0_u32;
+                for [lon, lat] in samples {
+                    let class = cover.sample(*lon, *lat).with_context(|| {
+                        format!("Missing required land cover at {lat:.5}°, {lon:.5}°")
+                    })? as u8;
+                    ensure!(
+                        [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100].contains(&class),
+                        "Unknown WorldCover class {class} at {lat}, {lon}"
+                    );
+                    if class == 10 || class == 95 {
+                        trees += 1;
+                    }
+                    if class == 80 {
+                        water += 1;
+                    }
+                    let height = match elevation.sample(*lon, *lat) {
+                        Some(h) => h,
+                        None if class == 80 => 0.,
+                        None => {
+                            anyhow::bail!("Missing required land elevation at {lat:.5}°, {lon:.5}°")
+                        }
+                    };
+                    heights.push(height);
+                }
+                let mean = heights.iter().sum::<f64>() / heights.len() as f64;
+                let min = heights.iter().copied().fold(f64::INFINITY, f64::min);
+                let max = heights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let relief = max - min;
+                let slope = (relief / (radius * 1.64)).atan().to_degrees();
+                cell.generated_elevation_m = mean;
+                cell.elevation_m = mean;
+                cell.relief_m = relief;
+                cell.slope_degrees = slope;
+                cell.forest_fraction = f64::from(trees) / samples.len() as f64;
+                cell.water_fraction = f64::from(water) / samples.len() as f64;
+                cell.landscape = if relief >= settings.mountain_relief_m
+                    || slope >= settings.mountain_slope_degrees
+                {
+                    Landscape::Mountain
+                } else if cell.forest_fraction >= settings.forest_fraction {
+                    Landscape::Forest
+                } else {
+                    Landscape::Plains
+                };
+                if cell.water_fraction >= 0.5 {
+                    cell.surface = Surface::Water;
+                }
             }
-        }
-    }
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 pub fn rasterize_rivers(
@@ -380,7 +399,87 @@ pub fn summary(document: &MapDocument) -> BTreeMap<String, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gis::raster::RasterWindow;
     use std::collections::HashSet;
+
+    #[test]
+    fn parallel_sampling_preserves_cells_and_surface_and_propagates_errors() -> Result<()> {
+        let settings = GenerationSettings::default();
+        let projection = Projection::new(settings.region)?;
+        let (cells, _) = build_grid(&settings, &projection)?;
+        assert!(cells.len() > 512);
+        let layer = |values: Vec<f32>| RasterLayer {
+            windows: vec![RasterWindow {
+                bounds: [7., 45.5, 9.2, 47.8],
+                width: 64,
+                height: 64,
+                values,
+                nodata: None,
+                source: SourceRecord {
+                    name: "sampling fixture".into(),
+                    version: "1".into(),
+                    url: String::new(),
+                    license: String::new(),
+                    attribution: String::new(),
+                    acquired_unix: 0,
+                    etag: None,
+                    sha256: String::new(),
+                },
+            }],
+        };
+        let elevation = layer((0..64 * 64).map(|i| (i % 31) as f32 * 100.).collect());
+        let cover = layer((0..64 * 64).map(|i| [10., 30., 80.][i % 3]).collect());
+        let sample = || -> Result<_> {
+            let mut cells = cells.clone();
+            let context = JobContext::default();
+            aggregate_cells(&mut cells, &settings, &elevation, &cover, &context)?;
+            let field = source_height_field(
+                &cells,
+                settings.spacing_km * 1000.,
+                settings.region,
+                &elevation,
+                &cover,
+                &context,
+            )?;
+            Ok((cells, field))
+        };
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()?
+            .install(sample)?;
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+        let parallel = pool.install(sample)?;
+        assert_eq!(serial.0, parallel.0);
+        assert_eq!(serial.1.origin_m, parallel.1.origin_m);
+        assert_eq!(serial.1.width, parallel.1.width);
+        assert_eq!(serial.1.height, parallel.1.height);
+        assert_eq!(serial.1.elevations_m, parallel.1.elevations_m);
+        assert_eq!(serial.1.land_cover, parallel.1.land_cover);
+        let mut cells = cells;
+        let context = JobContext::default();
+        let missing = RasterLayer { windows: vec![] };
+        assert!(
+            pool.install(|| aggregate_cells(&mut cells, &settings, &missing, &cover, &context))
+                .is_err()
+        );
+        context.cancel();
+        assert!(
+            pool.install(|| aggregate_cells(&mut cells, &settings, &elevation, &cover, &context))
+                .is_err()
+        );
+        assert!(
+            pool.install(|| source_height_field(
+                &cells,
+                settings.spacing_km * 1000.,
+                settings.region,
+                &elevation,
+                &cover,
+                &context
+            ))
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn river_supercover_is_connected_across_boundaries_and_junctions() -> Result<()> {

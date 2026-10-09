@@ -1,3 +1,4 @@
+use crate::i18n::Message;
 use anyhow::{Result, bail};
 use std::sync::{
     Arc,
@@ -8,7 +9,7 @@ use std::sync::{
 #[derive(Debug, Clone)]
 pub struct Progress {
     pub fraction: f32,
-    pub message: String,
+    pub message: Message,
 }
 
 #[derive(Clone, Default)]
@@ -33,7 +34,7 @@ impl JobContext {
         }
         Ok(())
     }
-    pub fn report(&self, fraction: f32, message: impl Into<String>) -> Result<()> {
+    pub fn report(&self, fraction: f32, message: impl Into<Message>) -> Result<()> {
         self.check()?;
         let progress = Progress {
             fraction: fraction.clamp(0., 1.),

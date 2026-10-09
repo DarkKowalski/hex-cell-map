@@ -81,6 +81,7 @@ fn main() -> Result<()> {
     });
     let start = Instant::now();
     let document = generation::generate(&settings, &cache, &context)?;
+    println!("GIS generation: {:.2}s", start.elapsed().as_secs_f64());
     validate(&document, &cache, &context)?;
     if audit {
         println!(
@@ -89,7 +90,12 @@ fn main() -> Result<()> {
         );
     }
     if audit_terrain {
+        let terrain_start = Instant::now();
         let geometry = hex_cell_map::terrain::build(&document, document.heights, &context)?;
+        println!(
+            "Terrain build: {:.2}s",
+            terrain_start.elapsed().as_secs_f64()
+        );
         hex_cell_map::terrain::validate_topology(&geometry)?;
         let mut shared = std::collections::BTreeMap::new();
         let mut seams = 0;

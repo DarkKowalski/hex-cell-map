@@ -2,6 +2,8 @@
 
 Native Rust + Bevy GIS hex-map generator for Windows x64 and macOS Apple Silicon. Development follows [the roadmap](docs/roadmap.md). The desktop view uses continuous DEM terrain, merged river channels and source-mask water bodies, imported Kenney vegetation and suburban buildings, Poly Haven ground materials, urban hexes and adaptive height compression that preserves hills and mountain detail. Asset sources, CC0 licenses and the reproducible import pipeline are documented in [art assets](docs/art-assets.md).
 
+The [data pipeline and core algorithm](docs/data-pipeline.md) explains acquisition, hex aggregation, river and settlement assignment, continuous terrain, water conditioning and project storage, with native screenshots. A [简体中文版本](docs/data-pipeline.zh-CN.md) is available beside it.
+
 ## Build and run
 
 Install Rust through rustup, Git LFS, CMake and platform C++ tools: Xcode command-line tools on macOS, or Visual Studio 2022 Build Tools (Desktop development with C++) and LLVM on Windows. GDAL and PROJ build from source; no GIS SDK or manually prepared datasets are required. The first build can take substantially longer than subsequent builds. Hydrate the bundled models and textures before building:
@@ -16,7 +18,9 @@ cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Select a region in the sidebar and generate its map. Middle drag or Shift + left drag pans, right drag or Q/E rotates, the wheel zooms, and WASD pans. Click to inspect a hex. Trees appear only in forest land cells. Hex outlines use cached, shared edges; zoom in if the grid would be too small to read. Display height controls provide scale, an extreme-height threshold and local-relief enhancement, with immediate preview and unchanged source elevations. Urban cell controls apply or remove complete cells, adjust population/style and brush radius, and provide undo/redo. River cells retain their river identity; buildings use dry ground. Source settlement records remain available after an urban edit.
+Click the world map in the sidebar to open a larger area-selection window. Drag a rectangle and refine its coordinates, then close the window and generate the map. The selection also appears in the sidebar; Escape or clicking outside closes the window. Middle drag or Shift + left drag pans, right drag or Q/E rotates, the wheel zooms, and WASD pans. Click to inspect a hex. Trees appear only in forest land cells. Hex outlines are enabled by default and use cached, shared edges; zoom in if the grid would be too small to read. Display height controls provide scale, an extreme-height threshold and local-relief enhancement, with immediate preview and unchanged source elevations. Urban cell controls apply or remove complete cells, adjust population/style and brush radius, and provide undo/redo. River cells retain their river identity; buildings use dry ground. Source settlement records remain available after an urban edit.
+
+The sidebar's **Language / 语言** selector switches between English and Simplified Chinese (简体中文) immediately, including status and progress messages, and remembers your choice in the platform configuration directory under `hex-cell-map/preferences.json`. The first launch follows your OS language, with English as the fallback. Use `cargo run --locked --bin hex-cell-map -- --lang zh-CN` (or `--lang en`) to override the language for one launch. Translations and the Chinese font are embedded for offline use; source attributions and upstream technical diagnostics retain their original text.
 
 The Project panel opens and saves self-contained JSON snapshots to the entered path, including height settings and urban edits. A previous valid snapshot is retained as `.hexmap.bak`. General terrain/elevation brushes, broader project workflow and release performance gates are in later milestones.
 
@@ -34,6 +38,8 @@ The probe automatically retrieves Copernicus GLO-90, ESA WorldCover 2021, HydroR
 Use `--bounds WEST SOUTH EAST NORTH` and `--spacing KM` for other supported regions. Limits are 1–20 km between neighboring hex centers, 1,000 km extent, 100,000 hexes and latitude ±60°, without antimeridian crossings. All boundary hexes intersecting the selection are included. Cell statistics use 13 deterministic samples; a separate projected source field controls terrain and materials. Visible river widths, urban footprints and buildings are symbolic at operational scale.
 
 Caches use the platform cache directory under `hex-cell-map`. Set `HEX_MAP_CACHE_DIR` or use probe `--cache DIR` to change acquisition storage. Initial generation needs internet access; complete snapshots reopen offline without caches. Failures preserve the currently open map.
+
+Raster acquisition, GIS cell and surface sampling, water footprint unions and terrain chunk construction use a shared Rayon worker pool. It automatically uses the available CPU threads, with raster reads limited to four concurrent tiles. Set `RAYON_NUM_THREADS` before launching either binary to limit CPU use; `RAYON_NUM_THREADS=1` provides a serial comparison. The probe reports GIS generation and terrain build times separately when run with `--audit-terrain`. Results retain deterministic tile/cell/chunk order and matching terrain seams across thread counts.
 
 ## Development packaging
 

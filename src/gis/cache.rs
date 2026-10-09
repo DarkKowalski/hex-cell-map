@@ -1,3 +1,4 @@
+use crate::i18n::Message;
 use crate::{jobs::JobContext, map_core::SourceRecord};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -90,7 +91,9 @@ impl Cache {
         for attempt in 0..3 {
             context.report(
                 progress,
-                format!("Downloading {filename} (attempt {})", attempt + 1),
+                Message::new("progress.downloading")
+                    .arg("filename", filename)
+                    .arg("attempt", attempt + 1),
             )?;
             match self.download_once(url, &path, context, progress) {
                 Ok(etag) => {
@@ -172,15 +175,16 @@ impl Cache {
                 );
                 context.report(
                     progress,
-                    format!(
-                        "Downloading {}: {:.1} / {:.1} MB",
-                        destination
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy(),
-                        written as f64 / 1e6,
-                        size as f64 / 1e6
-                    ),
+                    Message::new("progress.download_bytes")
+                        .arg(
+                            "filename",
+                            destination
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy(),
+                        )
+                        .arg("written", format!("{:.1}", written as f64 / 1e6))
+                        .arg("size", format!("{:.1}", size as f64 / 1e6)),
                 )?;
             }
             ensure!(written == size, "Truncated GIS download");
