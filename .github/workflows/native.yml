@@ -18,17 +18,20 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '13.0'
   PYTHONUTF8: '1'
 
-defaults:
-  run:
-    shell: bash
-
 jobs:
   native:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, windows-2022]
+        include:
+          - os: macos-14
+            shell: bash
+          - os: windows-2022
+            shell: pwsh
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     timeout-minutes: 120
     env:
       PACKAGE_PROFILE: ${{ inputs.profile || 'debug' }}
@@ -51,6 +54,11 @@ jobs:
         run: |
           choco install sqlite cmake llvm --no-progress -y
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          $linker = (Get-Command link.exe -CommandType Application).Source
+          if ($linker -notlike '*Microsoft Visual Studio*') {
+            throw "Expected the MSVC linker, found $linker"
+          }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
       - name: macOS build dependencies
         if: runner.os == 'macOS'
         run: brew install cmake
@@ -59,6 +67,7 @@ jobs:
           key: ${{ env.PACKAGE_PROFILE }}
       - name: Validate release version
         if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
         run: |
           python - <<'PY'
           import os, tomllib
@@ -74,6 +83,7 @@ jobs:
       - name: Build applications
         run: cargo build --locked --bins ${{ inputs.profile == 'release' && '--release' || '' }}
       - name: Bundle and test extracted packages
+        shell: bash
         run: |
           tag_args=()
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
