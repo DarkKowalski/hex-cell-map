@@ -54,9 +54,9 @@ jobs:
         run: |
           choco install sqlite cmake llvm --no-progress -y
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
-          $linker = (Get-Command link.exe -CommandType Application).Source
-          if ($linker -notlike '*Microsoft Visual Studio*') {
-            throw "Expected the MSVC linker, found $linker"
+          $linker = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64\link.exe'
+          if (!(Test-Path $linker)) {
+            throw "MSVC linker is missing: $linker"
           }
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
       - name: macOS build dependencies
