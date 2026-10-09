@@ -85,13 +85,22 @@ def verify_archive(archive, package_name, apple):
                            cwd=destination, env=offline_environment(), check=True, capture_output=True)
 
 
+def write_zip(package, archive):
+    # Dependency notices can retain dates before ZIP's 1980 lower bound.
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED,
+                         strict_timestamps=False) as stream:
+        stream.write(package, package.name)
+        for path in sorted(package.rglob("*")):
+            stream.write(path, path.relative_to(package.parent))
+
+
 def create_archive(package, version, apple):
     platform_name = "macos-arm64" if apple else "windows-x64"
     archive = package.parent / f"hex-cell-map-v{version}-{platform_name}.zip"
     if apple:
         command("ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(package), str(archive))
     else:
-        shutil.make_archive(str(archive.with_suffix("")), "zip", package.parent, package.name)
+        write_zip(package, archive)
     verify_archive(archive, package.name, apple)
     with archive.open("rb") as stream:
         checksum = hashlib.file_digest(stream, "sha256").hexdigest()
